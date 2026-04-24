@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: mindmesh-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mindmesh
+      POSTGRES_PASSWORD: mindmesh
+      POSTGRES_DB: mindmesh
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mindmesh -d mindmesh']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  orchestrator:
+    image: python:3.11-slim
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: >
+      sh -lc "python -m pip install -r backend/orchestrator/requirements.txt
+      && python -m uvicorn backend.orchestrator.app.main:app --host 0.0.0.0 --port 8081"
+    environment:
+      ORCHESTRATOR_SERVICE_NAME: mindmesh-orchestrator
+      ORCHESTRATOR_HOST: 0.0.0.0
+      ORCHESTRATOR_PORT: '8081'
+      ORCHESTRATOR_LOG_LEVEL: INFO
+      ORCHESTRATOR_ENGINE: ${ORCHESTRATOR_ENGINE:-auto}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      INTERNAL_AUTH_ISSUER: public-api
+      INTERNAL_AUTH_AUDIENCE: crewai-orchestrator
+      INTERNAL_AUTH_LEEWAY_SEC: '60'
+      INTERNAL_AUTH_SHARED_SECRETS: ${INTERNAL_AUTH_SHARED_SECRETS:-change-me-1,change-me-2}
+    ports:
+      - '8081:8081'
+
+  api:
+    image: node:20-bookworm
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: >
+      sh -lc "npm install && npm run dev:api"
+    environment:
+      PORT: '4020'
+      LOG_LEVEL: info
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://build.lewisnote.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.4-mini}
+      ORCHESTRATION_MODE: ${ORCHESTRATION_MODE:-hybrid}
+      ORCHESTRATION_CREWAI_PERCENT: ${ORCHESTRATION_CREWAI_PERCENT:-10}
+      ORCHESTRATOR_URL: http://orchestrator:8081
+      ORCHESTRATOR_TIMEOUT_MS: '45000'
+      AUTH_REQUIRED: ${AUTH_REQUIRED:-false}
+      AUTH_BYPASS: ${AUTH_BYPASS:-true}
+      AUTH_STRICT_SCOPES: ${AUTH_STRICT_SCOPES:-false}
+      AUTH_JWKS_URI: ${AUTH_JWKS_URI:-}
+      AUTH_ISSUER: ${AUTH_ISSUER:-}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      INTERNAL_AUTH_ISSUER: public-api
+      INTERNAL_AUTH_AUDIENCE: crewai-orchestrator
+      INTERNAL_AUTH_KID: v1
+      INTERNAL_AUTH_TTL_SEC: '90'
+      INTERNAL_AUTH_SHARED_SECRETS: ${INTERNAL_AUTH_SHARED_SECRETS:-change-me-1,change-me-2}
+      ASR_API_KEY: ${ASR_API_KEY:-}
+      ASR_MODEL: ${ASR_MODEL:-afri-asr}
+      ASR_ENDPOINT: ${ASR_ENDPOINT:-https://build.lewisnote.com/v1/audio/afri-asr/transcribe}
+      ASR_TIMEOUT_MS: '45000'
+      TRANSCRIBE_MAX_BYTES: '10485760'
+      DATABASE_ENABLED: 'true'
+      DATABASE_URL: postgresql://mindmesh:mindmesh@postgres:5432/mindmesh
+      DATABASE_SSL: 'false'
+      DATABASE_INIT_MAX_RETRIES: '10'
+      DATABASE_INIT_RETRY_MS: '1500'
+      DB_LOG_RETENTION_DAYS: ${DB_LOG_RETENTION_DAYS:-90}
+      DB_RETENTION_CLEANUP_INTERVAL_MIN: ${DB_RETENTION_CLEANUP_INTERVAL_MIN:-360}
+      RATE_LIMIT_WINDOW_MS: '60000'
+      RATE_LIMIT_CHAT_MAX: '30'
+      RATE_LIMIT_TRANSCRIBE_MAX: '12'
+    ports:
+      - '4020:4020'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+
+volumes:
+  postgres_data:
