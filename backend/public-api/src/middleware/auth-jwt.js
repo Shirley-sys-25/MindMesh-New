@@ -52,6 +52,8 @@ const parseBearer = (authorizationHeader) => {
   return token.trim();
 };
 
+const FALLBACK_READ_ONLY_SCOPES = ['read:only'];
+
 export const authJwtMiddleware = async (req, _res, next) => {
   try {
     if (!env.authRequired || env.authBypass) {
@@ -90,7 +92,7 @@ export const authJwtMiddleware = async (req, _res, next) => {
       sub: payload.sub,
       scopes: (() => {
         const parsed = parseScopes(payload);
-        return parsed.length > 0 ? parsed : env.authDefaultScopes;
+        return parsed.length > 0 ? parsed : FALLBACK_READ_ONLY_SCOPES;
       })(),
       roles: parseRoles(payload),
       claims: payload,

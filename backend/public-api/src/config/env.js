@@ -20,6 +20,12 @@ const toPercent = (value, fallback = 100) => {
   return Math.max(0, Math.min(100, parsed));
 };
 
+const toNonNegativeInt = (value, fallback = 0) => {
+  const parsed = toInt(value, fallback);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, parsed);
+};
+
 const toList = (value, fallback = []) => {
   if (!value || typeof value !== 'string') return fallback;
   return value
@@ -37,6 +43,8 @@ const mode = (process.env.ORCHESTRATION_MODE || 'legacy').trim().toLowerCase();
 const orchestrationMode = ['legacy', 'hybrid', 'crewai'].includes(mode) ? mode : 'legacy';
 
 const internalSecrets = toList(process.env.INTERNAL_AUTH_SHARED_SECRETS || process.env.INTERNAL_AUTH_SHARED_SECRET, []);
+const metricsAdminToken = (process.env.METRICS_ADMIN_TOKEN || '').trim();
+const metricsHeaderSecret = (process.env.METRICS_HEADER_SECRET || '').trim();
 const databaseEnabled = toBool(process.env.DATABASE_ENABLED, true);
 const databaseUrl = (process.env.DATABASE_URL || 'postgresql://mindmesh:mindmesh@localhost:5432/mindmesh').trim();
 const databaseInitMaxRetries = Math.max(1, toInt(process.env.DATABASE_INIT_MAX_RETRIES, 3));
@@ -62,11 +70,16 @@ if (databaseEnabled && !databaseUrl) {
   throw new Error('DATABASE_URL est requis quand DATABASE_ENABLED=true.');
 }
 
+if (isProd && !metricsAdminToken && !metricsHeaderSecret) {
+  throw new Error('METRICS_ADMIN_TOKEN ou METRICS_HEADER_SECRET est requis en production.');
+}
+
 export const env = {
   nodeEnv,
   isProd,
   port: toInt(process.env.PORT, 4020),
   logLevel: process.env.LOG_LEVEL || 'info',
+  trustProxyLevel: toNonNegativeInt(process.env.TRUST_PROXY_LEVEL, 0),
 
   corsAllowedOrigins: toList(process.env.CORS_ALLOWED_ORIGINS, ['http://localhost:3000']),
 
@@ -93,9 +106,12 @@ export const env = {
   authJwksUri: process.env.AUTH_JWKS_URI || '',
   authIssuer: process.env.AUTH_ISSUER || '',
   authAudience: toList(process.env.AUTH_AUDIENCE, []),
-  authDefaultScopes: toList(process.env.AUTH_DEFAULT_SCOPES, ['chat:write', 'transcribe:write']),
+  authDefaultScopes: toList(process.env.AUTH_DEFAULT_SCOPES, ['read:only']),
   authStrictScopes: toBool(process.env.AUTH_STRICT_SCOPES, isProd),
   authLeewaySeconds: toInt(process.env.AUTH_LEEWAY_SECONDS, 60),
+
+  metricsAdminToken,
+  metricsHeaderSecret,
 
   orchestrationMode,
   orchestrationCrewaiPercent: toPercent(process.env.ORCHESTRATION_CREWAI_PERCENT, 100),

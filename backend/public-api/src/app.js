@@ -27,7 +27,7 @@ const buildCorsOptions = () => {
 export const createApp = () => {
   const app = express();
 
-  app.set('trust proxy', 1);
+  app.set('trust proxy', env.trustProxyLevel);
   app.use(requestIdMiddleware);
 
   app.use(

@@ -93,7 +93,7 @@ export const initializeDatabase = async () => {
       try {
         pool = new Pool({
           connectionString: env.databaseUrl,
-          ssl: env.databaseSsl ? { rejectUnauthorized: false } : false,
+          ssl: env.databaseSsl ? { rejectUnauthorized: true } : false,
         });
 
         await pool.query('SELECT 1');

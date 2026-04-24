@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { AppError } from '../utils/errors.js';
 
-const allowedRoles = new Set(['system', 'user', 'assistant']);
+const allowedRoles = new Set(['user', 'assistant']);
 
 const messageSchema = z.object({
   role: z.string().min(1),
@@ -28,6 +28,14 @@ export const parseChatRequest = (payload) => {
   const result = chatRequestSchema.safeParse(payload);
   if (!result.success) {
     throw new AppError(400, 'CHAT_INVALID_PAYLOAD', 'Format invalide.');
+  }
+
+  const hasSystemRole = result.data.messages.some((message) =>
+    typeof message?.role === 'string' && message.role.trim().toLowerCase() === 'system',
+  );
+
+  if (hasSystemRole) {
+    throw new AppError(400, 'CHAT_SYSTEM_ROLE_FORBIDDEN', 'Le role system est interdit dans les messages client.');
   }
 
   const messages = normalizeMessages(result.data.messages);
