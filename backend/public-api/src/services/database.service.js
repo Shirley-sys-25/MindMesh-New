@@ -24,6 +24,41 @@ const clampText = (value, max = 400) => {
 
 const toNonNegativeInt = (value) => (Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0);
 
+const toSessionKey = (value) => {
+  const compact = String(value || '').trim();
+  return compact.length > 0 ? compact : null;
+};
+
+const toHistoryLimit = (value, fallback = 100) => {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(1, Math.min(500, parsed));
+};
+
+export const mapChatHistoryRows = (rows) => {
+  const messages = [];
+
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const userMessage = typeof row?.user_message === 'string' ? row.user_message.trim() : '';
+    const assistantMessage = typeof row?.assistant_message === 'string' ? row.assistant_message.trim() : '';
+    const status = String(row?.status || '').toLowerCase();
+
+    if (userMessage) {
+      messages.push({ role: 'user', content: userMessage });
+    }
+
+    if (assistantMessage) {
+      messages.push(
+        status === 'error'
+          ? { role: 'system', content: assistantMessage, tone: 'error' }
+          : { role: 'assistant', content: assistantMessage },
+      );
+    }
+  }
+
+  return messages;
+};
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const redactDatabaseUrl = (url) => {
@@ -229,10 +264,13 @@ export const closeDatabase = async () => {
 
 export const recordChatRequest = ({
   requestId,
+  sessionId,
   userSub,
   mode,
   orchestrationPath,
   messages,
+  userMessage,
+  assistantMessage,
   responseChars = 0,
   status = 'ok',
   errorCode = null,
@@ -245,18 +283,23 @@ export const recordChatRequest = ({
   const messageList = Array.isArray(messages) ? messages : [];
   const lastUserMessage = [...messageList].reverse().find((item) => item?.role === 'user');
   const promptPreview = clampText(lastUserMessage?.content || '');
+  const resolvedUserMessage = clampText(userMessage || lastUserMessage?.content || '', 400);
+  const resolvedAssistantMessage = clampText(assistantMessage || '', 4000);
 
   void pool
     .query(
       `INSERT INTO chat_requests
-      (request_id, user_sub, mode, orchestration_path, message_count, prompt_preview, response_chars, status, error_code)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      (request_id, session_id, user_sub, mode, orchestration_path, message_count, user_message, assistant_message, prompt_preview, response_chars, status, error_code)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [
         requestId || null,
+        toSessionKey(sessionId),
         userSub || null,
         String(mode || 'unknown'),
         String(orchestrationPath || 'unknown'),
         messageList.length,
+        resolvedUserMessage || null,
+        resolvedAssistantMessage || null,
         promptPreview || null,
         toNonNegativeInt(responseChars),
         String(status || 'unknown'),
@@ -266,6 +309,54 @@ export const recordChatRequest = ({
     .catch((error) => {
       logger.warn({ err: error, request_id: requestId }, 'database_record_chat_failed');
     });
+};
+
+export const getChatHistory = async ({ sessionId, userSub, limit = 100 }) => {
+  if (!isReady()) {
+    return {
+      sessionId: toSessionKey(sessionId) || toSessionKey(userSub),
+      messages: [],
+    };
+  }
+
+  const pool = state.pool;
+  if (!pool) {
+    return {
+      sessionId: toSessionKey(sessionId) || toSessionKey(userSub),
+      messages: [],
+    };
+  }
+
+  const resolvedSessionId = toSessionKey(sessionId) || toSessionKey(userSub);
+  if (!resolvedSessionId) {
+    return {
+      sessionId: null,
+      messages: [],
+    };
+  }
+
+  const safeLimit = toHistoryLimit(limit, 100);
+  const hasUserSub = typeof userSub === 'string' && userSub.trim().length > 0;
+  const queryText = hasUserSub
+    ? `SELECT created_at, status, user_message, assistant_message
+       FROM chat_requests
+       WHERE session_id = $1 AND user_sub = $2
+       ORDER BY created_at ASC, id ASC
+       LIMIT $3`
+    : `SELECT created_at, status, user_message, assistant_message
+       FROM chat_requests
+       WHERE session_id = $1
+       ORDER BY created_at ASC, id ASC
+       LIMIT $2`;
+  const queryParams = hasUserSub ? [resolvedSessionId, userSub.trim(), safeLimit] : [resolvedSessionId, safeLimit];
+
+  const result = await pool.query(queryText, queryParams);
+
+  return {
+    sessionId: resolvedSessionId,
+    messages: mapChatHistoryRows(result.rows),
+    count: result.rows.length,
+  };
 };
 
 export const recordTranscribeRequest = ({

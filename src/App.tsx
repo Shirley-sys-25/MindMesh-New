@@ -1,8 +1,8 @@
-﻿import { useState, useEffect, useRef } from 'react';
+﻿import { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   Plus, Target, Trophy, Brain, Send, Mic, Share2, Download, Play, Code, Eye,
   Terminal, Activity, Globe, Search, Zap, LayoutDashboard,
-  ShieldCheck, Cpu, Sun, Moon
+  ShieldCheck, Cpu, Sun, Moon, AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
@@ -13,7 +13,7 @@ interface Agent {
 }
 
 interface Message {
-  role: 'user' | 'assistant' | 'system'; content: string;
+  role: 'user' | 'assistant' | 'system'; content: string; tone?: 'error';
 }
 
 interface SessionLog {
@@ -21,6 +21,29 @@ interface SessionLog {
   timestamp: string;
   message: string;
   tone: 'info' | 'success' | 'warn';
+}
+
+interface BackendSnapshot {
+  health: 'ok' | 'down' | 'unknown';
+  ready: 'ready' | 'degraded' | 'down' | 'unknown';
+  mode: string;
+  databaseStatus: string;
+  reason: string;
+  updatedAt: number | null;
+}
+
+interface WorkspaceNotice {
+  tone: 'info' | 'success' | 'warn';
+  text: string;
+}
+
+interface MetricsSnapshot {
+  httpRequestsTotal: number | null;
+  orchestratorCallsTotal: number | null;
+  providerErrorsTotal: number | null;
+  authFailuresTotal: number | null;
+  error: string | null;
+  updatedAt: number | null;
 }
 
 const preferredRecorderMimeTypes = [
@@ -89,6 +112,76 @@ const readErrorPayload = async (response: Response): Promise<{ code: string; mes
   return { code, message };
 };
 
+const readChatErrorPayload = async (response: Response): Promise<{ code: string; message: string }> => {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  const rawBody = await response.text();
+  const bodySnippet = shrinkText(rawBody);
+
+  let payload: any = null;
+  if (rawBody && (contentType.includes('application/json') || rawBody.trim().startsWith('{'))) {
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      payload = null;
+    }
+  }
+
+  const nestedDetail = payload?.detail && typeof payload.detail === 'object' ? payload.detail : null;
+  const code =
+    (typeof payload?.error?.code === 'string' && payload.error.code) ||
+    (typeof payload?.code === 'string' && payload.code) ||
+    (typeof nestedDetail?.code === 'string' && nestedDetail.code) ||
+    'CHAT_HTTP_ERROR';
+
+  const message =
+    (typeof payload?.error?.message === 'string' && payload.error.message) ||
+    (typeof payload?.message === 'string' && payload.message) ||
+    (typeof nestedDetail?.message === 'string' && nestedDetail.message) ||
+    bodySnippet ||
+    `Erreur HTTP ${response.status}`;
+
+  return { code, message };
+};
+
+const readPromCounterValue = (metricsRaw: string, metricName: string): number | null => {
+  const pattern = new RegExp(`^${metricName}(?:\\{[^}]*\\})?\\s+(-?\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?)$`, 'gim');
+  let total = 0;
+  let found = false;
+  let match: RegExpExecArray | null = pattern.exec(metricsRaw);
+
+  while (match) {
+    const parsed = Number(match[1]);
+    if (Number.isFinite(parsed)) {
+      total += parsed;
+      found = true;
+    }
+    match = pattern.exec(metricsRaw);
+  }
+
+  return found ? total : null;
+};
+
+const SESSION_STORAGE_KEY = 'mindmesh.session_id';
+
+const createSessionId = (): string => {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+
+  return 'session-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+};
+
+const readOrCreateSessionId = (): string => {
+  if (typeof window === 'undefined') return createSessionId();
+
+  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
+  if (existing) return existing;
+
+  const generated = createSessionId();
+  window.localStorage.setItem(SESSION_STORAGE_KEY, generated);
+  return generated;
+};
+
 export default function App() {
   const { signOut, openUserProfile } = useClerk();
   const { getToken } = useAuth();
@@ -107,6 +200,26 @@ export default function App() {
   const [objectiveStep, setObjectiveStep] = useState(0);
   const [currentObjective, setCurrentObjective] = useState<string | null>(null);
   const [securityScore, setSecurityScore] = useState(99.8);
+  const [isExecutingWorkspace, setIsExecutingWorkspace] = useState(false);
+  const [workspaceNotice, setWorkspaceNotice] = useState<WorkspaceNotice | null>(null);
+  const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
+  const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot>({
+    health: 'unknown',
+    ready: 'unknown',
+    mode: 'unknown',
+    databaseStatus: 'unknown',
+    reason: 'Aucune synchronisation pour le moment.',
+    updatedAt: null,
+  });
+  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot>({
+    httpRequestsTotal: null,
+    orchestratorCallsTotal: null,
+    providerErrorsTotal: null,
+    authFailuresTotal: null,
+    error: null,
+    updatedAt: null,
+  });
+  const [sessionId, setSessionId] = useState(() => readOrCreateSessionId());
 
   // ÉTATS ET RÉFÉRENCES POUR LE MICRO
   const [isRecording, setIsRecording] = useState(false);
@@ -114,6 +227,7 @@ export default function App() {
   const audioChunksRef = useRef<Blob[]>([]);
   const recorderMimeTypeRef = useRef<string>('audio/webm');
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
+  const workspaceNoticeTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', isDarkMode ? 'dark' : 'light');
@@ -126,17 +240,55 @@ export default function App() {
 
   const latestAssistantMessage =
     [...messages].reverse().find((m) => m.role === 'assistant')?.content ?? '';
+  const totalMessages = messages.length;
+  const userMessagesCount = messages.filter((m) => m.role === 'user').length;
+  const assistantMessagesCount = messages.filter((m) => m.role === 'assistant').length;
+  const failedMessagesCount = messages.filter((m) => m.role === 'system' && m.tone === 'error').length;
   const completedSteps = objectiveStep;
+  const UPGRADE_URL = (import.meta.env.VITE_UPGRADE_URL || import.meta.env.VITE_BILLING_URL || '').trim();
+  const BILLING_URL = (import.meta.env.VITE_BILLING_URL || '').trim();
+  const METRICS_SECRET = (import.meta.env.VITE_METRICS_SECRET || '').trim();
+  const METRICS_ADMIN_TOKEN = (import.meta.env.VITE_METRICS_ADMIN_TOKEN || '').trim();
   const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, '');
 
-  const getAuthorizationHeaders = async (): Promise<Record<string, string>> => {
+  const getAuthorizationHeaders = useCallback(async (): Promise<Record<string, string>> => {
     try {
       const token = await getToken();
       return token ? { Authorization: 'Bearer ' + token } : {};
     } catch {
       return {};
     }
-  };
+  }, [getToken]);
+
+  const loadChatHistory = useCallback(async () => {
+    try {
+      const authHeaders = await getAuthorizationHeaders();
+      const response = await fetch(`${API_BASE_URL}/api/chat/history?limit=100`, {
+        headers: {
+          ...authHeaders,
+          'X-Session-Id': sessionId,
+        },
+      });
+
+      if (!response.ok) return;
+
+      const payload = await response.json();
+      const loadedMessages = Array.isArray(payload?.messages)
+        ? payload.messages
+            .filter((item: any) => item && typeof item === 'object')
+            .map((item: any) => ({
+              role: item.role === 'assistant' || item.role === 'system' ? item.role : 'user',
+              content: typeof item.content === 'string' ? item.content : '',
+              tone: item.tone === 'error' ? 'error' : undefined,
+            }))
+            .filter((item: Message) => item.content.trim().length > 0)
+        : [];
+
+      setMessages(loadedMessages);
+    } catch (error) {
+      console.error('Historique chat indisponible:', error);
+    }
+  }, [API_BASE_URL, getAuthorizationHeaders, sessionId]);
 
   const evaluatePromptSecurity = (prompt: string): number => {
     if (!prompt.trim()) return 99.8;
@@ -226,10 +378,341 @@ export default function App() {
     });
   };
 
+  const pushChatErrorMessage = (errorText: string) => {
+    const fallback = `Connexion API impossible. Vérifie que le backend tourne sur ${API_BASE_URL}.`;
+    const compact = shrinkText(errorText || '', 260);
+    const messageText = compact || fallback;
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: 'system',
+        content: messageText,
+        tone: 'error',
+      },
+    ]);
+  };
+
   const getLogToneClass = (tone: SessionLog['tone']) => {
     if (tone === 'success') return 'text-green-500';
     if (tone === 'warn') return 'text-amber-500';
     return 'text-purple-500';
+  };
+
+  const showWorkspaceNotice = useCallback((tone: WorkspaceNotice['tone'], text: string) => {
+    setWorkspaceNotice({ tone, text });
+
+    if (workspaceNoticeTimeoutRef.current !== null) {
+      window.clearTimeout(workspaceNoticeTimeoutRef.current);
+    }
+
+    workspaceNoticeTimeoutRef.current = window.setTimeout(() => {
+      setWorkspaceNotice(null);
+      workspaceNoticeTimeoutRef.current = null;
+    }, 5000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (workspaceNoticeTimeoutRef.current !== null) {
+        window.clearTimeout(workspaceNoticeTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const getMetricsHeaders = useCallback(async () => {
+    const headers: Record<string, string> = { ...(await getAuthorizationHeaders()) };
+
+    if (METRICS_SECRET) {
+      headers['X-Metrics-Secret'] = METRICS_SECRET;
+    }
+
+    if (!headers.Authorization && METRICS_ADMIN_TOKEN) {
+      headers.Authorization = 'Bearer ' + METRICS_ADMIN_TOKEN;
+    }
+
+    return headers;
+  }, [METRICS_ADMIN_TOKEN, METRICS_SECRET, getAuthorizationHeaders]);
+
+  const refreshBackendSnapshot = useCallback(async () => {
+    setIsRefreshingSnapshot(true);
+
+    try {
+      const [healthResponse, readyResponse] = await Promise.all([
+        fetch(`${API_BASE_URL}/healthz`),
+        fetch(`${API_BASE_URL}/readyz`),
+      ]);
+
+      let healthPayload: any = null;
+      let readyPayload: any = null;
+
+      if (healthResponse.ok) {
+        try {
+          healthPayload = await healthResponse.json();
+        } catch {
+          healthPayload = null;
+        }
+      }
+
+      try {
+        readyPayload = await readyResponse.json();
+      } catch {
+        readyPayload = null;
+      }
+
+      const health: BackendSnapshot['health'] =
+        healthResponse.ok && healthPayload?.status === 'ok' ? 'ok' : 'down';
+
+      const ready: BackendSnapshot['ready'] = (() => {
+        if (!readyResponse.ok) return 'down';
+        if (readyPayload?.status === 'ready' && readyPayload?.degraded) return 'degraded';
+        if (readyPayload?.status === 'ready') return 'ready';
+        return 'degraded';
+      })();
+
+      setBackendSnapshot({
+        health,
+        ready,
+        mode: typeof readyPayload?.mode === 'string' ? readyPayload.mode : 'unknown',
+        databaseStatus:
+          (typeof readyPayload?.database?.status === 'string' && readyPayload.database.status) ||
+          (typeof healthPayload?.database?.status === 'string' && healthPayload.database.status) ||
+          'unknown',
+        reason:
+          (typeof readyPayload?.reason === 'string' && readyPayload.reason) ||
+          (ready === 'ready' ? 'Tous les checks backend sont au vert.' : 'Backend degrade ou indisponible.'),
+        updatedAt: Date.now(),
+      });
+    } catch (error) {
+      console.error('Snapshot backend indisponible:', error);
+      setBackendSnapshot({
+        health: 'down',
+        ready: 'down',
+        mode: 'unknown',
+        databaseStatus: 'unknown',
+        reason: 'API locale inaccessible. Verifie le serveur backend.',
+        updatedAt: Date.now(),
+      });
+    }
+
+    try {
+      const metricsHeaders = await getMetricsHeaders();
+      const metricsResponse = await fetch(`${API_BASE_URL}/metrics`, {
+        headers: metricsHeaders,
+      });
+
+      if (!metricsResponse.ok) {
+        const statusHint =
+          metricsResponse.status === 401
+            ? 'Acces /metrics protege (configure VITE_METRICS_SECRET ou VITE_METRICS_ADMIN_TOKEN).'
+            : `Impossible de lire /metrics (${metricsResponse.status}).`;
+        setMetricsSnapshot((prev) => ({
+          ...prev,
+          error: statusHint,
+          updatedAt: Date.now(),
+        }));
+      } else {
+        const metricsRaw = await metricsResponse.text();
+        setMetricsSnapshot({
+          httpRequestsTotal: readPromCounterValue(metricsRaw, 'mindmesh_http_requests_total'),
+          orchestratorCallsTotal: readPromCounterValue(metricsRaw, 'mindmesh_orchestrator_calls_total'),
+          providerErrorsTotal: readPromCounterValue(metricsRaw, 'mindmesh_provider_errors_total'),
+          authFailuresTotal: readPromCounterValue(metricsRaw, 'mindmesh_auth_failures_total'),
+          error: null,
+          updatedAt: Date.now(),
+        });
+      }
+    } catch (error) {
+      console.error('Snapshot metrics indisponible:', error);
+      setMetricsSnapshot((prev) => ({
+        ...prev,
+        error: 'Lecture metrics impossible (reseau ou credentials).',
+        updatedAt: Date.now(),
+      }));
+    } finally {
+      setIsRefreshingSnapshot(false);
+    }
+  }, [API_BASE_URL, getMetricsHeaders]);
+
+  useEffect(() => {
+    void refreshBackendSnapshot();
+    const interval = window.setInterval(() => {
+      void refreshBackendSnapshot();
+    }, 30000);
+
+    return () => window.clearInterval(interval);
+  }, [refreshBackendSnapshot]);
+
+  useEffect(() => {
+    void loadChatHistory();
+  }, [loadChatHistory]);
+
+  const formatSnapshotTime = (timestamp: number | null) => {
+    if (!timestamp) return '--';
+    return new Date(timestamp).toLocaleTimeString('fr-FR', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+  };
+
+  const workspaceRuntimeState =
+    backendSnapshot.ready === 'ready'
+      ? 'live'
+      : backendSnapshot.ready === 'degraded'
+        ? 'degraded'
+        : backendSnapshot.health === 'down'
+          ? 'offline'
+          : 'sync';
+
+  const workspaceRuntimeLabel =
+    workspaceRuntimeState === 'live'
+      ? 'Live'
+      : workspaceRuntimeState === 'degraded'
+        ? 'Degraded'
+        : workspaceRuntimeState === 'offline'
+          ? 'Offline'
+          : 'Sync';
+
+  const workspaceRuntimeDotClass =
+    workspaceRuntimeState === 'live'
+      ? 'bg-green-500 animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]'
+      : workspaceRuntimeState === 'degraded'
+        ? 'bg-amber-500 animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.6)]'
+        : workspaceRuntimeState === 'offline'
+          ? 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.5)]'
+          : 'bg-slate-400 animate-pulse';
+
+  const workspaceRuntimeTextClass =
+    workspaceRuntimeState === 'live'
+      ? isDarkMode
+        ? 'text-green-500'
+        : 'text-green-600'
+      : workspaceRuntimeState === 'degraded'
+        ? isDarkMode
+          ? 'text-amber-400'
+          : 'text-amber-600'
+        : workspaceRuntimeState === 'offline'
+          ? isDarkMode
+            ? 'text-red-400'
+            : 'text-red-600'
+          : isDarkMode
+            ? 'text-slate-300'
+            : 'text-slate-600';
+
+  const workspaceNoticeToneClass =
+    workspaceNotice?.tone === 'success'
+      ? isDarkMode
+        ? 'bg-green-500/10 border-green-500/30 text-green-200'
+        : 'bg-green-50 border-green-200 text-green-700'
+      : workspaceNotice?.tone === 'warn'
+        ? isDarkMode
+          ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
+          : 'bg-amber-50 border-amber-200 text-amber-700'
+        : isDarkMode
+          ? 'bg-purple-500/10 border-purple-500/30 text-purple-200'
+          : 'bg-purple-50 border-purple-200 text-purple-700';
+
+  const openExternalLink = (url: string, label: string) => {
+    if (!url) {
+      showWorkspaceNotice('warn', `${label} indisponible: URL non configuree.`);
+      return;
+    }
+
+    window.open(url, '_blank', 'noopener,noreferrer');
+    setShowMenu(false);
+    pushSessionLog(`${label} ouvert dans un nouvel onglet.`, 'success');
+    showWorkspaceNotice('success', `${label} ouvert.`);
+  };
+
+  const handleOpenUpgrade = () => {
+    if (UPGRADE_URL) {
+      openExternalLink(UPGRADE_URL, 'Upgrade');
+      return;
+    }
+
+    openUserProfile();
+    setShowMenu(false);
+    pushSessionLog('Profil utilisateur ouvert (fallback upgrade).', 'info');
+    showWorkspaceNotice('info', 'Espace upgrade ouvert via le profil utilisateur.');
+  };
+
+  const handleOpenBilling = () => {
+    if (BILLING_URL) {
+      openExternalLink(BILLING_URL, 'Facturation');
+      return;
+    }
+
+    openUserProfile();
+    setShowMenu(false);
+    pushSessionLog('Profil utilisateur ouvert (fallback facturation).', 'info');
+    showWorkspaceNotice('info', 'Espace facturation ouvert via le profil utilisateur.');
+  };
+
+  const formatCounter = (value: number | null) => {
+    if (value === null || !Number.isFinite(value)) return '--';
+    return Math.round(value).toLocaleString('fr-FR');
+  };
+
+  const handleDownloadWorkspace = () => {
+    const exportText = latestAssistantMessage.trim();
+    if (!exportText) {
+      showWorkspaceNotice('warn', 'Aucun contenu a exporter pour le moment.');
+      return;
+    }
+
+    const extension = activeTab === 'code' ? 'txt' : 'md';
+    const mimeType = activeTab === 'code' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
+    const fileName = `mindmesh-workspace-${Date.now()}.${extension}`;
+    const blob = new Blob([exportText], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = fileName;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+
+    pushSessionLog(`Export workspace (${fileName}) termine.`, 'success');
+    showWorkspaceNotice('success', 'Export telecharge avec succes.');
+  };
+
+  const handleShareWorkspace = async () => {
+    const exportText = latestAssistantMessage.trim();
+    if (!exportText) {
+      showWorkspaceNotice('warn', 'Aucun contenu a partager pour le moment.');
+      return;
+    }
+
+    const sharePayload = {
+      title: 'MindMesh Workspace',
+      text: shrinkText(exportText, 1900),
+    };
+
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.share === 'function') {
+        await navigator.share(sharePayload);
+        pushSessionLog('Partage workspace effectue.', 'success');
+        showWorkspaceNotice('success', 'Contenu partage avec succes.');
+        return;
+      }
+
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(exportText);
+        pushSessionLog('Copie workspace dans le presse-papiers.', 'success');
+        showWorkspaceNotice('success', 'Contenu copie dans le presse-papiers.');
+        return;
+      }
+
+      throw new Error('CLIPBOARD_UNAVAILABLE');
+    } catch (error) {
+      console.error('Partage workspace impossible:', error);
+      pushSessionLog('Partage workspace impossible.', 'warn');
+      showWorkspaceNotice('warn', 'Partage indisponible sur ce navigateur.');
+    }
   };
 
   const resetSession = () => {
@@ -242,10 +725,20 @@ export default function App() {
     setObjectiveStep(0);
     setCurrentObjective(null);
     setSecurityScore(99.8);
+
+    const nextSessionId = createSessionId();
+    if (typeof window !== 'undefined') {
+      try {
+        window.localStorage.setItem(SESSION_STORAGE_KEY, nextSessionId);
+      } catch {
+        // noop
+      }
+    }
+    setSessionId(nextSessionId);
   };
 
-  const handleSend = async () => {
-    const trimmedMessage = message.trim();
+  const sendPrompt = async (promptInput: string) => {
+    const trimmedMessage = promptInput.trim();
     if (!trimmedMessage || isLoading) return;
 
     const compactPrompt = trimmedMessage.replace(/\s+/g, ' ').trim();
@@ -299,11 +792,48 @@ export default function App() {
       const authHeaders = await getAuthorizationHeaders();
       const response = await fetch(`${API_BASE_URL}/api/chat`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Session-Id': sessionId,
+          ...authHeaders,
+        },
         body: JSON.stringify({ messages: nextMessages }),
       });
 
-      if (!response.ok || !response.body) throw new Error('Erreur de connexion');
+      if (!response.ok) {
+        const { code, message: apiMessage } = await readChatErrorPayload(response);
+        throw new Error(`${code}: ${apiMessage}`);
+      }
+
+      if (!response.body) {
+        throw new Error('CHAT_STREAM_UNAVAILABLE: Réponse sans flux de données.');
+      }
+
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+      if (!contentType.includes('text/event-stream')) {
+        const rawBody = await response.text();
+        let parsed: any = null;
+        try {
+          parsed = rawBody ? JSON.parse(rawBody) : null;
+        } catch {
+          parsed = null;
+        }
+
+        const directResponse =
+          (typeof parsed?.content === 'string' && parsed.content.trim()) ||
+          (typeof parsed?.message === 'string' && parsed.message.trim()) ||
+          rawBody.trim();
+
+        if (!directResponse) {
+          throw new Error('CHAT_EMPTY_RESPONSE: Le backend a répondu sans contenu exploitable.');
+        }
+
+        captureLatency();
+        pushSessionLog('Generation complete.', 'success');
+        setMessages((prev) => [...prev, { role: 'assistant', content: directResponse }]);
+        return;
+      }
 
       pushSessionLog('Core engine ready.');
 
@@ -352,7 +882,17 @@ export default function App() {
             }
 
             if (eventType === 'error') {
-              throw new Error(payload || 'Erreur de streaming');
+              let streamErrorMessage = payload || 'Erreur de streaming';
+              try {
+                const parsedError = JSON.parse(payload);
+                streamErrorMessage =
+                  (typeof parsedError?.error?.message === 'string' && parsedError.error.message) ||
+                  (typeof parsedError?.message === 'string' && parsedError.message) ||
+                  streamErrorMessage;
+              } catch {
+                // noop
+              }
+              throw new Error(`CHAT_STREAM_ERROR: ${streamErrorMessage}`);
             }
 
             assistantText += payload;
@@ -398,11 +938,39 @@ export default function App() {
       captureLatency();
       console.error('Erreur Chat:', error);
       pushSessionLog('Generation failed.', 'warn');
-      setMessages((prev) => [...prev, { role: 'assistant', content: 'Erreur : Connexion au Cerveau perdue.' }]);
+
+      const rawErrorMessage = error instanceof Error ? error.message : 'Connexion API impossible.';
+      const cleanedErrorMessage = rawErrorMessage.replace(/^[A-Z0-9_]+:\s*/i, '').trim();
+      pushChatErrorMessage(cleanedErrorMessage);
     } finally {
       setIsLoading(false);
+      setIsExecutingWorkspace(false);
       setActiveAgent(null);
     }
+  };
+
+  const handleSend = async () => {
+    await sendPrompt(message);
+  };
+
+  const handleExecuteWorkspace = async () => {
+    if (isLoading || isExecutingWorkspace) return;
+
+    const workspaceSeed = latestAssistantMessage.trim();
+    if (!workspaceSeed) {
+      showWorkspaceNotice('warn', 'Aucune sortie IA disponible a executer.');
+      return;
+    }
+
+    const executionPrompt =
+      'Transforme la sortie suivante en plan d\'execution operationnel avec checklist actionnable, risques et priorites:\n\n' +
+      workspaceSeed;
+
+    setCurrentView('chat');
+    setIsExecutingWorkspace(true);
+    pushSessionLog('Execution workspace declenchee...', 'info');
+    showWorkspaceNotice('info', 'Execution en cours via l\'orchestrateur.');
+    await sendPrompt(executionPrompt);
   };
 
   // GESTION DU MICRO
@@ -616,7 +1184,11 @@ export default function App() {
 
               {showMenu && (
                 <div className="absolute bottom-20 left-4 right-4 glass bg-white/95 dark:bg-black/80 backdrop-blur-xl p-2 rounded-xl border border-gray-200 dark:border-white/10 flex flex-col gap-1 z-50 shadow-2xl">
-                  <button className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-all border border-purple-500 shadow-[0_0_12px_rgba(168,85,247,0.25)] bg-purple-500/10 dark:bg-purple-500/20 font-bold text-purple-700 dark:text-purple-300">
+                  <button
+                    type="button"
+                    onClick={handleOpenUpgrade}
+                    className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-all border border-purple-500 shadow-[0_0_12px_rgba(168,85,247,0.25)] bg-purple-500/10 dark:bg-purple-500/20 font-bold text-purple-700 dark:text-purple-300"
+                  >
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
                     Passer Pro
                   </button>
@@ -624,7 +1196,11 @@ export default function App() {
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                     Paramètres
                   </button>
-                  <button className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-[var(--text)] hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-colors">
+                  <button
+                    type="button"
+                    onClick={handleOpenBilling}
+                    className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-[var(--text)] hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-colors"
+                  >
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect><line x1="1" y1="10" x2="23" y2="10"></line></svg>
                     Facturation
                   </button>
@@ -653,8 +1229,114 @@ export default function App() {
 
         <div className="flex-1 p-10 flex flex-col items-center justify-center relative overflow-hidden">
           {currentView === 'dashboard' ? (
-            <div className={`text-center max-w-2xl relative z-10 rounded-3xl border p-10 ${isDarkMode ? 'bg-white/5 border-white/10 text-gray-200' : 'bg-white border-purple-100 text-slate-700'}`}>
-              Tableau de bord en construction...
+            <div className={`w-full max-w-6xl relative z-10 rounded-3xl border p-8 md:p-10 ${isDarkMode ? 'bg-white/5 border-white/10 text-gray-200' : 'bg-white border-purple-100 text-slate-700'}`}>
+              <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <div>
+                  <h2 className={`text-2xl md:text-3xl font-serif tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>
+                    Tableau de bord opérationnel
+                  </h2>
+                  <p className={`text-xs mt-1 ${isDarkMode ? 'text-white/50' : 'text-slate-500'}`}>
+                    Etat backend, compteurs plateforme et indicateurs de session.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void refreshBackendSnapshot()}
+                  disabled={isRefreshingSnapshot}
+                  className={`px-4 py-2 rounded-xl border text-xs font-bold tracking-wide transition-colors ${
+                    isRefreshingSnapshot
+                      ? `${isDarkMode ? 'bg-white/5 border-white/10 text-white/40' : 'bg-slate-100 border-slate-200 text-slate-400'} cursor-not-allowed`
+                      : `${isDarkMode ? 'bg-purple-500/10 border-purple-400/30 text-purple-200 hover:bg-purple-500/20' : 'bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100'}`
+                  }`}
+                >
+                  {isRefreshingSnapshot ? 'Synchronisation...' : 'Rafraîchir'}
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
+                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Health</div>
+                  <div className={`mt-2 text-xl font-semibold ${backendSnapshot.health === 'ok' ? (isDarkMode ? 'text-green-400' : 'text-green-600') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
+                    {backendSnapshot.health.toUpperCase()}
+                  </div>
+                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>maj: {formatSnapshotTime(backendSnapshot.updatedAt)}</div>
+                </div>
+
+                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Readiness</div>
+                  <div className={`mt-2 text-xl font-semibold ${backendSnapshot.ready === 'ready' ? (isDarkMode ? 'text-green-400' : 'text-green-600') : backendSnapshot.ready === 'degraded' ? (isDarkMode ? 'text-amber-400' : 'text-amber-600') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
+                    {backendSnapshot.ready.toUpperCase()}
+                  </div>
+                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>mode: {backendSnapshot.mode}</div>
+                </div>
+
+                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Database</div>
+                  <div className={`mt-2 text-xl font-semibold ${isDarkMode ? 'text-purple-300' : 'text-purple-700'}`}>
+                    {backendSnapshot.databaseStatus.toUpperCase()}
+                  </div>
+                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>raison: {shrinkText(backendSnapshot.reason, 55) || '--'}</div>
+                </div>
+
+                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Session</div>
+                  <div className={`mt-2 text-xl font-semibold ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{totalMessages}</div>
+                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>messages totaux</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div className={`rounded-2xl border p-5 ${isDarkMode ? 'bg-black/20 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black mb-4 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Compteurs backend</div>
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
+                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>HTTP req</div>
+                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.httpRequestsTotal)}</div>
+                    </div>
+                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
+                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Orchestrator</div>
+                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.orchestratorCallsTotal)}</div>
+                    </div>
+                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
+                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Provider errs</div>
+                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.providerErrorsTotal)}</div>
+                    </div>
+                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
+                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Auth fails</div>
+                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.authFailuresTotal)}</div>
+                    </div>
+                  </div>
+                  <div className={`text-xs mt-4 ${metricsSnapshot.error ? (isDarkMode ? 'text-amber-300' : 'text-amber-700') : (isDarkMode ? 'text-white/40' : 'text-slate-500')}`}>
+                    {metricsSnapshot.error || `Dernière collecte: ${formatSnapshotTime(metricsSnapshot.updatedAt)}`}
+                  </div>
+                </div>
+
+                <div className={`rounded-2xl border p-5 ${isDarkMode ? 'bg-black/20 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black mb-4 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>KPI conversation</div>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Messages utilisateur</span>
+                      <span className="font-semibold">{userMessagesCount}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Réponses assistant</span>
+                      <span className="font-semibold">{assistantMessagesCount}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Erreurs UI/API</span>
+                      <span className={`font-semibold ${failedMessagesCount > 0 ? (isDarkMode ? 'text-red-400' : 'text-red-600') : ''}`}>{failedMessagesCount}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Latence observée</span>
+                      <span className="font-semibold">{latencyMs !== null ? `${latencyMs.toFixed(1)}ms` : '--'}</span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Logs session</span>
+                      <span className="font-semibold">{sessionLogs.length}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           ) : (
           <AnimatePresence mode="wait">
@@ -697,29 +1379,43 @@ export default function App() {
                 animate={{ opacity: 1 }}
                 className="w-full h-full flex flex-col gap-6 overflow-y-auto custom-scrollbar p-6 relative z-10 mx-auto"
               >
-                {messages.map((m, index) => (
-                  <div key={index} className={`flex gap-4 ${m.role === 'user' ? 'justify-end' : ''}`}>
-                    {m.role === 'assistant' && (
+                {messages.map((m, index) => {
+                  const isUserMessage = m.role === 'user';
+                  const isAssistantMessage = m.role === 'assistant';
+                  const isErrorMessage = m.role === 'system' && m.tone === 'error';
+
+                  return (
+                  <div key={index} className={`flex gap-4 ${isUserMessage ? 'justify-end' : ''}`}>
+                    {isAssistantMessage && (
                       <div className="w-10 h-10 rounded-full bg-purple-500/10 flex items-center justify-center text-purple-500 border border-purple-500/20 shrink-0">
                         <Brain size={18} />
                       </div>
                     )}
+
+                    {isErrorMessage && (
+                      <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 border border-red-500/30 shrink-0">
+                        <AlertTriangle size={18} />
+                      </div>
+                    )}
                     
                     <div className={`p-5 rounded-[24px] max-w-[80%] text-sm leading-relaxed markdown-body ${
-                      m.role === 'user' 
+                      isUserMessage 
                         ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-br-none shadow-lg shadow-purple-500/20' 
-                        : `${isDarkMode ? 'bg-white/5 border border-white/10 text-gray-200' : 'bg-white border border-purple-100 text-slate-700 shadow-sm'} rounded-bl-none`
+                        : isErrorMessage
+                          ? `${isDarkMode ? 'bg-red-500/10 border border-red-500/40 text-red-100' : 'bg-red-50 border border-red-200 text-red-700'} rounded-bl-none`
+                          : `${isDarkMode ? 'bg-white/5 border border-white/10 text-gray-200' : 'bg-white border border-purple-100 text-slate-700 shadow-sm'} rounded-bl-none`
                     }`}>
                       <ReactMarkdown>{m.content}</ReactMarkdown>
                     </div>
                     
-                    {m.role === 'user' && (
+                    {isUserMessage && (
                       <div className="w-10 h-10 rounded-full bg-gray-900 flex items-center justify-center border border-white/10 overflow-hidden shrink-0 shadow-lg">
                         <img src={user?.imageUrl || "https://picsum.photos/seed/userelegant/100/100"} alt="Avatar user" className="w-full h-full object-cover" />
                       </div>
                     )}
                   </div>
-                ))}
+                  );
+                })}
                 
                 {isLoading && (
                   <div className="flex gap-4">
@@ -738,6 +1434,11 @@ export default function App() {
 
         <div className="p-10 pt-0 w-full flex justify-center">
           <div className="flex flex-col items-center gap-8 w-full max-w-4xl">
+            {workspaceNotice && (
+              <div className={`w-full rounded-2xl border px-4 py-3 text-sm font-medium ${workspaceNoticeToneClass}`}>
+                {workspaceNotice.text}
+              </div>
+            )}
             <SignedOut>
               <div className='w-full text-center p-4 glass rounded-2xl text-[var(--text-dim)] text-sm'>Veuillez vous connecter pour instruire MindMesh.</div>
             </SignedOut>
@@ -830,11 +1531,32 @@ export default function App() {
                   </div>
                   
                   <div className="flex items-center gap-2">
-                    <button className={`p-2.5 ${isDarkMode ? 'bg-white/5 text-white/20 hover:text-white' : 'bg-purple-100 text-purple-900/50 hover:text-purple-600'} rounded-xl transition-all`}><Download className="w-4 h-4" /></button>
-                    <button className={`p-2.5 ${isDarkMode ? 'bg-white/5 text-white/20 hover:text-white' : 'bg-purple-100 text-purple-900/50 hover:text-purple-600'} rounded-xl transition-all`}><Share2 className="w-4 h-4" /></button>
-                    <button className={`flex items-center gap-2 px-5 py-2.5 gradient-vibrant text-white rounded-xl text-[10px] font-black uppercase tracking-[0.1em] shadow-xl hover:scale-105 transition-all shadow-purple-500/20`}>
+                    <button
+                      type="button"
+                      onClick={handleDownloadWorkspace}
+                      className={`p-2.5 ${isDarkMode ? 'bg-white/5 text-white/20 hover:text-white' : 'bg-purple-100 text-purple-900/50 hover:text-purple-600'} rounded-xl transition-all`}
+                    >
+                      <Download className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleShareWorkspace()}
+                      className={`p-2.5 ${isDarkMode ? 'bg-white/5 text-white/20 hover:text-white' : 'bg-purple-100 text-purple-900/50 hover:text-purple-600'} rounded-xl transition-all`}
+                    >
+                      <Share2 className="w-4 h-4" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleExecuteWorkspace()}
+                      disabled={isLoading || isExecutingWorkspace || !latestAssistantMessage.trim()}
+                      className={`flex items-center gap-2 px-5 py-2.5 gradient-vibrant text-white rounded-xl text-[10px] font-black uppercase tracking-[0.1em] shadow-xl transition-all shadow-purple-500/20 ${
+                        isLoading || isExecutingWorkspace || !latestAssistantMessage.trim()
+                          ? 'opacity-60 cursor-not-allowed'
+                          : 'hover:scale-105'
+                      }`}
+                    >
                       <Play className="w-3.5 h-3.5 fill-current" />
-                      <span>Exécuter</span>
+                      <span>{isExecutingWorkspace ? 'Exécution...' : 'Exécuter'}</span>
                     </button>
                   </div>
                 </div>
@@ -842,8 +1564,8 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <span className={`text-[10px] font-black tracking-[0.3em] uppercase ${isDarkMode ? 'text-white/20' : 'text-purple-950/60'}`}>ESPACE DE TRAVAIL</span>
                   <div className="flex items-center gap-2 px-3 py-1 glass rounded-full border border-white/10">
-                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(34,197,94,0.6)]" />
-                    <span className={`text-[9px] font-black tracking-widest ${isDarkMode ? 'text-green-500' : 'text-green-600'} uppercase`}>Live</span>
+                    <div className={`w-1.5 h-1.5 rounded-full ${workspaceRuntimeDotClass}`} />
+                    <span className={`text-[9px] font-black tracking-widest uppercase ${workspaceRuntimeTextClass}`}>{workspaceRuntimeLabel}</span>
                   </div>
               </div>
 
@@ -940,7 +1662,7 @@ export default function App() {
                     className="space-y-2 opacity-80 max-h-28 overflow-y-auto custom-scrollbar pr-1"
                   >
                     {sessionLogs.length === 0 ? (
-                      <div className="text-[10px] text-purple-500/70">No logs yet.</div>
+                      <div className="text-[10px] text-purple-500/70">Aucun log pour le moment.</div>
                     ) : (
                       sessionLogs.map((log) => (
                         <div key={log.id} className={'flex gap-3 font-medium ' + getLogToneClass(log.tone)}>

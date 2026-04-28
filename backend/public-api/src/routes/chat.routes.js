@@ -7,7 +7,7 @@ import { chatRateLimit } from '../middleware/rate-limit.js';
 import { parseChatRequest } from '../schemas/chat.schema.js';
 import { createLegacyChatStream } from '../services/openai.service.js';
 import { invokeOrchestrator } from '../services/orchestrator-client.js';
-import { recordChatRequest } from '../services/database.service.js';
+import { getChatHistory, recordChatRequest } from '../services/database.service.js';
 import { decideOrchestrationPath } from '../services/orchestration-rollout.js';
 import { recordOrchestratorCall, recordProviderError } from '../services/metrics.service.js';
 import { AppError } from '../utils/errors.js';
@@ -16,29 +16,36 @@ import { closeSseWithDone, initSse, writeSseData, writeSseEvent } from '../utils
 const streamLegacy = async (messages, res) => {
   const stream = await createLegacyChatStream(messages);
   let responseChars = 0;
+  let responseText = '';
   for await (const chunk of stream) {
     const content = chunk?.choices?.[0]?.delta?.content || '';
     if (!content) continue;
     responseChars += content.length;
+    responseText += content;
     writeSseData(res, content);
   }
-  return responseChars;
+  return { responseChars, responseText };
 };
 
 const streamChatHandler = async (req, res, next) => {
   let messages = [];
   let routingTarget = 'unknown';
   let persisted = false;
+  const sessionId = (typeof req.get('x-session-id') === 'string' ? req.get('x-session-id').trim() : '') || req.auth?.sub || req.requestId;
+  let assistantMessage = '';
 
-  const persistChat = ({ responseChars = 0, status = 'ok', errorCode = null } = {}) => {
+  const persistChat = ({ responseChars = 0, status = 'ok', errorCode = null, assistantMessage: nextAssistantMessage = assistantMessage } = {}) => {
     if (persisted) return;
     persisted = true;
     recordChatRequest({
       requestId: req.requestId,
+      sessionId,
       userSub: req.auth?.sub,
       mode: env.orchestrationMode,
       orchestrationPath: routingTarget,
       messages,
+      userMessage: [...messages].reverse().find((item) => item?.role === 'user')?.content || '',
+      assistantMessage: nextAssistantMessage,
       responseChars,
       status,
       errorCode,
@@ -63,10 +70,12 @@ const streamChatHandler = async (req, res, next) => {
       if (env.orchestrationMode !== 'legacy') {
         recordOrchestratorCall(env.orchestrationMode, 'rollout_legacy');
       }
-      const responseChars = await streamLegacy(messages, res);
+      const legacyResult = await streamLegacy(messages, res);
+      assistantMessage = legacyResult.responseText;
       persistChat({
-        responseChars,
+        responseChars: legacyResult.responseChars,
         status: 'ok',
+        assistantMessage,
       });
       closeSseWithDone(res);
       return;
@@ -80,10 +89,12 @@ const streamChatHandler = async (req, res, next) => {
       });
 
       recordOrchestratorCall(env.orchestrationMode, 'ok');
-      writeSseData(res, orchestrated.content);
+      assistantMessage = typeof orchestrated.content === 'string' ? orchestrated.content : '';
+      writeSseData(res, assistantMessage);
       persistChat({
-        responseChars: typeof orchestrated.content === 'string' ? orchestrated.content.length : 0,
+        responseChars: assistantMessage.length,
         status: 'ok',
+        assistantMessage,
       });
       closeSseWithDone(res);
       return;
@@ -99,11 +110,13 @@ const streamChatHandler = async (req, res, next) => {
       );
 
       if (env.orchestrationMode === 'hybrid') {
-        const responseChars = await streamLegacy(messages, res);
+        const legacyResult = await streamLegacy(messages, res);
+        assistantMessage = legacyResult.responseText;
         recordOrchestratorCall(env.orchestrationMode, 'fallback_legacy');
         persistChat({
-          responseChars,
+          responseChars: legacyResult.responseChars,
           status: 'fallback_legacy',
+          assistantMessage,
           errorCode: orchestratorError?.code || 'ORCHESTRATOR_FAILED',
         });
         closeSseWithDone(res);
@@ -114,9 +127,13 @@ const streamChatHandler = async (req, res, next) => {
     }
   } catch (error) {
     recordProviderError('chat', error?.code || 'runtime_error');
+    if (!assistantMessage) {
+      assistantMessage = 'Impossible de joindre le cerveau.';
+    }
     persistChat({
       responseChars: 0,
       status: 'error',
+      assistantMessage,
       errorCode: error?.code || 'CHAT_RUNTIME_ERROR',
     });
 
@@ -131,5 +148,23 @@ const streamChatHandler = async (req, res, next) => {
 };
 
 export const chatRouter = Router();
+
+chatRouter.get('/chat/history', authJwtMiddleware, async (req, res, next) => {
+  try {
+    const history = await getChatHistory({
+      sessionId: req.get('x-session-id') || req.query.session_id,
+      userSub: req.auth?.sub,
+      limit: req.query.limit,
+    });
+
+    return res.json({
+      session_id: history.sessionId,
+      count: history.count || 0,
+      messages: history.messages,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 chatRouter.post('/chat', authJwtMiddleware, authorizeScope('chat:write'), chatRateLimit, streamChatHandler);
