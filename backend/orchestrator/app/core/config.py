@@ -55,8 +55,8 @@ def get_settings() -> Settings:
         log_level=os.getenv("ORCHESTRATOR_LOG_LEVEL", "INFO"),
         orchestrator_engine=_orchestrator_engine(os.getenv("ORCHESTRATOR_ENGINE")),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini"),
-        openai_base_url=os.getenv("OPENAI_BASE_URL", ""),
+        openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "https://build.lewisnote.com/v1"),
         internal_auth_issuer=os.getenv("INTERNAL_AUTH_ISSUER", "public-api"),
         internal_auth_audience=os.getenv(
             "INTERNAL_AUTH_AUDIENCE", "crewai-orchestrator"

@@ -7,6 +7,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface Agent {
   id: string; name: string; role: string; icon: any;
@@ -192,7 +193,6 @@ export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [activeAgent, setActiveAgent] = useState<string | null>(null);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionLogs, setSessionLogs] = useState<SessionLog[]>([]);
   const [currentView, setCurrentView] = useState<'chat' | 'dashboard'>('chat');
@@ -203,6 +203,11 @@ export default function App() {
   const [isExecutingWorkspace, setIsExecutingWorkspace] = useState(false);
   const [workspaceNotice, setWorkspaceNotice] = useState<WorkspaceNotice | null>(null);
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
+  const [agentStatuses, setAgentStatuses] = useState<Record<string, 'idle' | 'working'>>({
+    africonnect: 'idle',
+    analyste_marche: 'idle',
+    stratege_seo: 'idle',
+  });
   const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot>({
     health: 'unknown',
     ready: 'unknown',
@@ -259,6 +264,14 @@ export default function App() {
       return {};
     }
   }, [getToken]);
+
+  const resetAgentStatuses = () => {
+    setAgentStatuses({
+      africonnect: 'idle',
+      analyste_marche: 'idle',
+      stratege_seo: 'idle',
+    });
+  };
 
   const loadChatHistory = useCallback(async () => {
     try {
@@ -330,31 +343,10 @@ export default function App() {
         : (isDarkMode ? 'text-red-300' : 'text-red-600');
   
   const agents: Agent[] = [
-    { id: 'AfriConnect', name: 'AfriConnect (Fon)', role: 'Traduction & Contexte Local', icon: Globe },
-    { id: 'Analyste', name: 'Analyste Marche', role: 'Analyse des tendances...', icon: Search },
-    { id: 'SEO', name: 'Stratege SEO', role: 'Optimisation visibilite', icon: Zap },
+    { id: 'africonnect', name: 'AfriConnect', role: 'Traduction & Contexte Local', icon: Globe },
+    { id: 'analyste_marche', name: 'Analyste Marché', role: 'Analyse des tendances...', icon: Search },
+    { id: 'stratege_seo', name: 'Stratège SEO', role: 'Optimisation visibilité', icon: Zap },
   ];
-
-  const detectAgentFromPrompt = (prompt: string): string | null => {
-    const normalizedPrompt = prompt
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-
-    if (['marche', 'vendre', 'comprendre'].some((keyword) => normalizedPrompt.includes(keyword))) {
-      return 'Analyste';
-    }
-
-    if (['seo', 'visibilite'].some((keyword) => normalizedPrompt.includes(keyword))) {
-      return 'SEO';
-    }
-
-    if (['traduction', 'local'].some((keyword) => normalizedPrompt.includes(keyword))) {
-      return 'AfriConnect';
-    }
-
-    return null;
-  };
 
   const formatLogTime = (timestamp: number) =>
     new Date(timestamp).toLocaleTimeString('fr-FR', {
@@ -421,18 +413,12 @@ export default function App() {
   }, []);
 
   const getMetricsHeaders = useCallback(async () => {
-    const headers: Record<string, string> = { ...(await getAuthorizationHeaders()) };
-
-    if (METRICS_SECRET) {
-      headers['X-Metrics-Secret'] = METRICS_SECRET;
-    }
-
-    if (!headers.Authorization && METRICS_ADMIN_TOKEN) {
+    const headers: Record<string, string> = {};
+    if (METRICS_ADMIN_TOKEN) {
       headers.Authorization = 'Bearer ' + METRICS_ADMIN_TOKEN;
     }
-
     return headers;
-  }, [METRICS_ADMIN_TOKEN, METRICS_SECRET, getAuthorizationHeaders]);
+  }, [METRICS_ADMIN_TOKEN]);
 
   const refreshBackendSnapshot = useCallback(async () => {
     setIsRefreshingSnapshot(true);
@@ -504,7 +490,7 @@ export default function App() {
       if (!metricsResponse.ok) {
         const statusHint =
           metricsResponse.status === 401
-            ? 'Acces /metrics protege (configure VITE_METRICS_SECRET ou VITE_METRICS_ADMIN_TOKEN).'
+            ? 'Acces /metrics protege (configure VITE_METRICS_ADMIN_TOKEN).'
             : `Impossible de lire /metrics (${metricsResponse.status}).`;
         setMetricsSnapshot((prev) => ({
           ...prev,
@@ -614,6 +600,12 @@ export default function App() {
           ? 'bg-purple-500/10 border-purple-500/30 text-purple-200'
           : 'bg-purple-50 border-purple-200 text-purple-700';
 
+  const markdownBubbleClass = isDarkMode
+    ? 'prose prose-invert max-w-none prose-headings:text-inherit prose-p:my-3 prose-p:leading-relaxed prose-strong:text-inherit prose-em:text-inherit prose-a:text-fuchsia-300 prose-a:no-underline hover:prose-a:underline prose-ul:my-3 prose-ol:my-3 prose-li:my-1 prose-li:marker:text-purple-400 prose-blockquote:border-purple-400/30 prose-blockquote:text-inherit prose-code:text-fuchsia-200 prose-code:bg-white/10 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-pre:bg-black/30 prose-pre:border prose-pre:border-white/10'
+    : 'prose prose-slate max-w-none prose-headings:text-inherit prose-p:my-3 prose-p:leading-relaxed prose-strong:text-inherit prose-em:text-inherit prose-a:text-purple-700 prose-a:no-underline hover:prose-a:underline prose-ul:my-3 prose-ol:my-3 prose-li:my-1 prose-li:marker:text-purple-500 prose-blockquote:border-purple-400/30 prose-blockquote:text-inherit prose-code:text-purple-700 prose-code:bg-purple-100 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded-md prose-pre:bg-slate-50 prose-pre:border prose-pre:border-purple-100';
+
+  const latestAssistantMarkdown = (latestAssistantMessage || 'Aucune réponse disponible pour le moment.').replace(/\\n/g, '\n');
+
   const openExternalLink = (url: string, label: string) => {
     if (!url) {
       showWorkspaceNotice('warn', `${label} indisponible: URL non configuree.`);
@@ -720,7 +712,7 @@ export default function App() {
     setMessage('');
     setSessionLogs([]);
     setLatencyMs(null);
-    setActiveAgent(null);
+    resetAgentStatuses();
     setObjectiveProgress(0);
     setObjectiveStep(0);
     setCurrentObjective(null);
@@ -751,10 +743,17 @@ export default function App() {
       const hasObjectiveIntent = ['objectif', 'analyser', 'je veux', 'lancer'].some((keyword) =>
         normalizedPrompt.includes(keyword)
       );
+      const fallbackObjectiveLabel = (() => {
+        const firstWords = compactPrompt.split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
+        if (!firstWords) return compactPrompt;
+        return compactPrompt.split(/\s+/).filter(Boolean).length > 8 ? firstWords + '...' : firstWords;
+      })();
 
       if (hasObjectiveIntent) {
         const objectiveLabel = compactPrompt.length > 25 ? compactPrompt.slice(0, 25) + '...' : compactPrompt;
         setCurrentObjective(objectiveLabel);
+      } else {
+        setCurrentObjective(fallbackObjectiveLabel);
       }
     }
 
@@ -769,24 +768,18 @@ export default function App() {
     };
 
     const userMessage: Message = { role: 'user', content: trimmedMessage };
-    const routedAgent = detectAgentFromPrompt(trimmedMessage);
     setSecurityScore(evaluatePromptSecurity(trimmedMessage));
-    const routedAgentName = agents.find((agent) => agent.id === routedAgent)?.name;
     const nextMessages = [...messages, userMessage];
 
     setMessages(nextMessages);
-    setActiveAgent(routedAgent);
+    resetAgentStatuses();
     setMessage('');
     setIsLoading(true);
     setObjectiveStep((prev) => Math.min(prev + 1, 5));
     setObjectiveProgress((prev) => Math.min(prev + 20, 100));
 
     pushSessionLog('Awaiting sync...');
-    if (routedAgentName) {
-      pushSessionLog('Routing to ' + routedAgentName + '...');
-    } else {
-      pushSessionLog('Routing to orchestrator...');
-    }
+    pushSessionLog('Routing to orchestrator...');
 
     try {
       const authHeaders = await getAuthorizationHeaders();
@@ -881,6 +874,26 @@ export default function App() {
               break;
             }
 
+            if (eventType === 'agent_status') {
+              const data = payload;
+              console.log('🟢 [SSE Télémétrie] Statut Agent reçu:', data);
+              try {
+                const parsedStatus = JSON.parse(data);
+                const mappedAgent = String(parsedStatus?.agent || '').trim().toLowerCase();
+                const nextStatus = parsedStatus?.status === 'working' ? 'working' : 'idle';
+
+                if (mappedAgent && Object.prototype.hasOwnProperty.call(agentStatuses, mappedAgent)) {
+                  setAgentStatuses((prev) => ({
+                    ...prev,
+                    [mappedAgent]: nextStatus,
+                  }));
+                }
+              } catch (statusError) {
+                console.warn('agent_status SSE parse failed:', statusError);
+              }
+              continue;
+            }
+
             if (eventType === 'error') {
               let streamErrorMessage = payload || 'Erreur de streaming';
               try {
@@ -945,7 +958,6 @@ export default function App() {
     } finally {
       setIsLoading(false);
       setIsExecutingWorkspace(false);
-      setActiveAgent(null);
     }
   };
 
@@ -1398,14 +1410,18 @@ export default function App() {
                       </div>
                     )}
                     
-                    <div className={`p-5 rounded-[24px] max-w-[80%] text-sm leading-relaxed markdown-body ${
-                      isUserMessage 
-                        ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-br-none shadow-lg shadow-purple-500/20' 
+                    <div className={`text-sm leading-relaxed markdown-body ${markdownBubbleClass} ${
+                      isUserMessage
+                        ? 'w-fit max-w-[80%] px-4 py-2 rounded-2xl bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-br-none shadow-lg shadow-purple-500/20 whitespace-pre-wrap break-words'
                         : isErrorMessage
-                          ? `${isDarkMode ? 'bg-red-500/10 border border-red-500/40 text-red-100' : 'bg-red-50 border border-red-200 text-red-700'} rounded-bl-none`
-                          : `${isDarkMode ? 'bg-white/5 border border-white/10 text-gray-200' : 'bg-white border border-purple-100 text-slate-700 shadow-sm'} rounded-bl-none`
+                          ? `w-fit max-w-[80%] px-4 py-2 rounded-2xl rounded-bl-none ${isDarkMode ? 'bg-red-500/10 border border-red-500/40 text-red-100' : 'bg-red-50 border border-red-200 text-red-700'}`
+                          : `w-fit max-w-[80%] px-4 py-2 rounded-2xl rounded-bl-none ${isDarkMode ? 'bg-white/5 border border-white/10 text-gray-200' : 'bg-white border border-purple-100 text-slate-700 shadow-sm'}`
                     }`}>
-                      <ReactMarkdown>{m.content}</ReactMarkdown>
+                      {isUserMessage ? (
+                        <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      ) : (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{(m.content || '').replace(/\\n/g, '\n')}</ReactMarkdown>
+                      )}
                     </div>
                     
                     {isUserMessage && (
@@ -1572,9 +1588,9 @@ export default function App() {
               <div className="px-10 pt-8">
                 <div className={`rounded-[28px] border backdrop-blur-xl p-6 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-200 bg-white/70'}`}>
                   {activeTab === 'preview' ? (
-                    <div className={`markdown-body text-sm leading-relaxed ${isDarkMode ? 'text-gray-200' : 'text-slate-700'}`}>
-                      <ReactMarkdown>
-                        {latestAssistantMessage || 'Aucune réponse disponible pour le moment.'}
+                    <div className={`markdown-body ${markdownBubbleClass} text-sm leading-relaxed ${isDarkMode ? 'text-gray-200' : 'text-slate-700'}`}>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                        {latestAssistantMarkdown}
                       </ReactMarkdown>
                     </div>
                   ) : (
@@ -1593,7 +1609,7 @@ export default function App() {
 
                 <div className="space-y-4">
                   {agents.map((agent) => {
-                    const isAgentActive = activeAgent === agent.id;
+                    const isAgentActive = agentStatuses[agent.id] === 'working';
                     return (
                     <motion.div 
                       key={agent.id}

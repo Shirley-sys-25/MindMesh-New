@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
+from collections.abc import Iterator
 
 from ..core.config import get_settings
 from .agents import build_agents
@@ -30,7 +33,8 @@ class MindMeshCrewOrchestrator:
     def _run_with_crewai(self, latest_user_message: str) -> str | None:
         if self.settings.orchestrator_engine == "skeleton":
             return None
-        if not self.settings.openai_api_key:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
             logger.info("crewai_disabled_missing_openai_key")
             return None
 
@@ -41,14 +45,16 @@ class MindMeshCrewOrchestrator:
             return None
 
         llm_kwargs = {
-            "model": self.settings.openai_model,
-            "api_key": self.settings.openai_api_key,
+            "model": "gpt-5.5",
+            "api_key": api_key,
+            "base_url": self.settings.openai_base_url or "https://build.lewisnote.com/v1",
         }
-        if self.settings.openai_base_url:
-            llm_kwargs["base_url"] = self.settings.openai_base_url
 
         try:
-            llm = LLM(**llm_kwargs)
+            try:
+                llm = LLM(**llm_kwargs, extra_body={"reasoning_effort": "high"})
+            except TypeError:
+                llm = LLM(**llm_kwargs, model_kwargs={"reasoning_effort": "high"})
 
             afri_connect = Agent(
                 role="AfriConnect",
@@ -114,6 +120,128 @@ class MindMeshCrewOrchestrator:
         except Exception as error:  # noqa: BLE001
             logger.warning("crewai_execution_failed", extra={"error": str(error)})
             return None
+
+    @staticmethod
+    def _sse_block(event_name: str, payload: object) -> str:
+        serialized = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+        lines = str(serialized).splitlines() or [""]
+        return f"event: {event_name}\n" + "\n".join(f"data: {line}" for line in lines) + "\n\n"
+
+    def stream(self, messages: list[dict[str, str]]) -> Iterator[str]:
+        latest_user_message = self._latest_user_message(messages)
+
+        if self.settings.orchestrator_engine == "skeleton":
+            yield self._sse_block("message", self._build_skeleton_content(latest_user_message))
+            yield self._sse_block("done", "[DONE]")
+            return
+
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            yield self._sse_block("message", self._build_skeleton_content(latest_user_message))
+            yield self._sse_block("done", "[DONE]")
+            return
+
+        try:
+            from crewai import Agent, Crew, LLM, Task
+        except Exception as error:  # noqa: BLE001
+            logger.warning("crewai_import_failed", extra={"error": str(error)})
+            yield self._sse_block("message", self._build_skeleton_content(latest_user_message))
+            yield self._sse_block("done", "[DONE]")
+            return
+
+        llm_kwargs = {
+            "model": "gpt-5.5",
+            "api_key": api_key,
+            "base_url": self.settings.openai_base_url or "https://build.lewisnote.com/v1",
+        }
+
+        try:
+            try:
+                llm = LLM(**llm_kwargs, extra_body={"reasoning_effort": "high"})
+            except TypeError:
+                llm = LLM(**llm_kwargs, model_kwargs={"reasoning_effort": "high"})
+
+            stages = [
+                {
+                    "id": "africonnect",
+                    "role": "AfriConnect",
+                    "goal": "Adapter le message au contexte local francophone et africain.",
+                    "backstory": "Expert en adaptation linguistique et culturelle.",
+                    "description": (
+                        "Analyse la demande utilisateur et produis un cadrage en francais avec "
+                        "contexte, objectifs et contraintes implicites. "
+                        f"Demande utilisateur: {latest_user_message.strip()}"
+                    ),
+                    "expected_output": "Un cadrage concis en francais.",
+                },
+                {
+                    "id": "analyste_marche",
+                    "role": "Analyste Marche",
+                    "goal": "Identifier les opportunites actionnables pour l'objectif utilisateur.",
+                    "backstory": "Analyste senior en positionnement de marche.",
+                    "description": (
+                        "A partir du cadrage precedent, propose un plan d'action en 3 etapes avec "
+                        "des priorites claires, hypotheses et indicateurs de succes. "
+                        "Conserve le contexte du cadrage precedent et transforme-le en plan opérationnel."
+                    ),
+                    "expected_output": "Un plan d'action en 3 etapes prioritaires.",
+                },
+                {
+                    "id": "stratege_seo",
+                    "role": "Stratege SEO",
+                    "goal": "Proposer une strategie SEO claire et mesurable.",
+                    "backstory": "Specialiste en croissance organique et priorisation contenu.",
+                    "description": (
+                        "Complete le plan avec une strategie contenu/SEO sur 30 jours: structure "
+                        "des contenus, themes prioritaires, quick wins et prochaines actions. "
+                        "Appuie-toi sur les deux etapes precedentes pour livrer un plan final exploitable."
+                    ),
+                    "expected_output": "Une strategie SEO operationnelle sur 30 jours.",
+                },
+            ]
+
+            stage_outputs: list[str] = []
+            previous_context = latest_user_message.strip()
+
+            for stage in stages:
+                yield self._sse_block("agent_status", {"agent": stage["id"], "status": "working"})
+
+                agent = Agent(
+                    role=stage["role"],
+                    goal=stage["goal"],
+                    backstory=stage["backstory"],
+                    llm=llm,
+                    allow_delegation=False,
+                    verbose=False,
+                )
+
+                task = Task(
+                    description=f"{stage['description']}\n\nContexte precedent: {previous_context}",
+                    expected_output=stage["expected_output"],
+                    agent=agent,
+                )
+
+                crew = Crew(agents=[agent], tasks=[task], verbose=False)
+                output = crew.kickoff()
+                content = (getattr(output, "raw", None) or str(output)).strip()
+
+                if content:
+                    stage_outputs.append(content)
+                    previous_context = content
+                    yield self._sse_block("message", content)
+
+                yield self._sse_block("agent_status", {"agent": stage["id"], "status": "idle"})
+
+            if not stage_outputs:
+                yield self._sse_block("message", self._build_skeleton_content(latest_user_message))
+
+            yield self._sse_block("done", "[DONE]")
+        except Exception as error:  # noqa: BLE001
+            logger.warning("crewai_stream_failed", extra={"error": str(error)})
+            yield self._sse_block(
+                "error",
+                {"code": "CREWAI_STREAM_FAILED", "message": "Orchestrateur injoignable."},
+            )
 
     def _build_skeleton_content(self, latest_user_message: str) -> str:
         return (

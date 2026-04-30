@@ -22,6 +22,12 @@ const clampText = (value, max = 400) => {
   return compact.length > max ? compact.slice(0, max) + '...' : compact;
 };
 
+const clampPreservingFormatting = (value, max = 4000) => {
+  const text = String(value ?? '');
+  if (!text) return '';
+  return text.length > max ? text.slice(0, max) + '...' : text;
+};
+
 const toNonNegativeInt = (value) => (Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0);
 
 const toSessionKey = (value) => {
@@ -39,8 +45,8 @@ export const mapChatHistoryRows = (rows) => {
   const messages = [];
 
   for (const row of Array.isArray(rows) ? rows : []) {
-    const userMessage = typeof row?.user_message === 'string' ? row.user_message.trim() : '';
-    const assistantMessage = typeof row?.assistant_message === 'string' ? row.assistant_message.trim() : '';
+    const userMessage = typeof row?.user_message === 'string' ? row.user_message : '';
+    const assistantMessage = typeof row?.assistant_message === 'string' ? row.assistant_message : '';
     const status = String(row?.status || '').toLowerCase();
 
     if (userMessage) {
@@ -283,8 +289,8 @@ export const recordChatRequest = ({
   const messageList = Array.isArray(messages) ? messages : [];
   const lastUserMessage = [...messageList].reverse().find((item) => item?.role === 'user');
   const promptPreview = clampText(lastUserMessage?.content || '');
-  const resolvedUserMessage = clampText(userMessage || lastUserMessage?.content || '', 400);
-  const resolvedAssistantMessage = clampText(assistantMessage || '', 4000);
+  const resolvedUserMessage = clampPreservingFormatting(userMessage || lastUserMessage?.content || '', 4000);
+  const resolvedAssistantMessage = clampPreservingFormatting(assistantMessage || '', 4000);
 
   void pool
     .query(

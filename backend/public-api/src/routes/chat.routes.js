@@ -6,7 +6,7 @@ import { authorizeScope } from '../middleware/authorize-scope.js';
 import { chatRateLimit } from '../middleware/rate-limit.js';
 import { parseChatRequest } from '../schemas/chat.schema.js';
 import { createLegacyChatStream } from '../services/openai.service.js';
-import { invokeOrchestrator } from '../services/orchestrator-client.js';
+import { streamOrchestrator } from '../services/orchestrator-client.js';
 import { getChatHistory, recordChatRequest } from '../services/database.service.js';
 import { decideOrchestrationPath } from '../services/orchestration-rollout.js';
 import { recordOrchestratorCall, recordProviderError } from '../services/metrics.service.js';
@@ -82,21 +82,63 @@ const streamChatHandler = async (req, res, next) => {
     }
 
     try {
-      const orchestrated = await invokeOrchestrator({
+      let streamEnded = false;
+      const orchestratorStream = streamOrchestrator({
         messages,
         requestId: req.requestId,
         userSub: req.auth?.sub,
       });
 
-      recordOrchestratorCall(env.orchestrationMode, 'ok');
-      assistantMessage = typeof orchestrated.content === 'string' ? orchestrated.content : '';
-      writeSseData(res, assistantMessage);
-      persistChat({
-        responseChars: assistantMessage.length,
-        status: 'ok',
-        assistantMessage,
-      });
-      closeSseWithDone(res);
+      for await (const event of orchestratorStream) {
+        if (event.type === 'message') {
+          const chunk = typeof event.payload === 'string' ? event.payload : '';
+          if (chunk) {
+            assistantMessage += chunk;
+            writeSseData(res, chunk);
+          }
+          continue;
+        }
+
+        if (event.type === 'agent_status') {
+          writeSseEvent(res, 'agent_status', event.payload || '{}');
+          continue;
+        }
+
+        if (event.type === 'done') {
+          streamEnded = true;
+          recordOrchestratorCall(env.orchestrationMode, 'ok');
+          persistChat({
+            responseChars: assistantMessage.length,
+            status: 'ok',
+            assistantMessage,
+          });
+          closeSseWithDone(res);
+          return;
+        }
+
+        if (event.type === 'error') {
+          const errorPayload = typeof event.payload === 'string' ? event.payload : '{}';
+          writeSseEvent(res, 'error', errorPayload);
+          recordOrchestratorCall(env.orchestrationMode, 'failed');
+          persistChat({
+            responseChars: assistantMessage.length,
+            status: 'error',
+            assistantMessage,
+            errorCode: 'CREWAI_STREAM_FAILED',
+          });
+          return res.end();
+        }
+      }
+
+      if (!streamEnded) {
+        recordOrchestratorCall(env.orchestrationMode, 'ok');
+        persistChat({
+          responseChars: assistantMessage.length,
+          status: 'ok',
+          assistantMessage,
+        });
+        closeSseWithDone(res);
+      }
       return;
     } catch (orchestratorError) {
       recordOrchestratorCall(env.orchestrationMode, 'failed');

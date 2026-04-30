@@ -1,5 +1,5 @@
 const serializeSseBlock = (payload) =>
-  payload
+  (typeof payload === 'string' ? payload : JSON.stringify(payload))
     .split(/\r?\n/)
     .map((line) => `data: ${line}`)
     .join('\n');

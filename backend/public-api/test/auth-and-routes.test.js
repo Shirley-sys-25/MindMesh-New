@@ -42,6 +42,36 @@ const buildOpenAiSseResponse = (chunks) => {
   });
 };
 
+const buildOrchestratorSseResponse = () => {
+  const sseEvent = (eventName, payload) => {
+    const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    return `event: ${eventName}\n${String(serialized)
+      .split('\n')
+      .map((line) => `data: ${line}`)
+      .join('\n')}\n\n`;
+  };
+
+  const payload = [
+    sseEvent('agent_status', { agent: 'africonnect', status: 'working' }),
+    sseEvent('message', 'Cadrage initial.'),
+    sseEvent('agent_status', { agent: 'africonnect', status: 'idle' }),
+    sseEvent('agent_status', { agent: 'analyste_marche', status: 'working' }),
+    sseEvent('message', 'Plan en 3 etapes.'),
+    sseEvent('agent_status', { agent: 'analyste_marche', status: 'idle' }),
+    sseEvent('agent_status', { agent: 'stratege_seo', status: 'working' }),
+    sseEvent('message', 'Strategie finale.'),
+    sseEvent('agent_status', { agent: 'stratege_seo', status: 'idle' }),
+    'event: done\ndata: [DONE]\n\n',
+  ].join('');
+
+  return new Response(payload, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+    },
+  });
+};
+
 process.env.AUTH_REQUIRED = 'false';
 process.env.AUTH_BYPASS = 'true';
 process.env.ORCHESTRATION_MODE = process.env.ORCHESTRATION_MODE || 'crewai';
@@ -245,11 +275,13 @@ test('POST /api/chat SSE crewai: success + done', { concurrency: false }, async 
 
   await withEnvPatch({ orchestrationMode: 'crewai', orchestrationCrewaiPercent: 100 }, async () => {
     await withMockedFetch(
-      async () =>
-        new Response(JSON.stringify({ content: 'Bonjour depuis orchestrateur', metadata: { source: 'test' } }), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+      async (url) => {
+        if (String(url).includes('/internal/orchestrate/stream')) {
+          return buildOrchestratorSseResponse();
+        }
+
+        throw new Error(`unexpected fetch target: ${String(url)}`);
+      },
       async () => {
         const response = await request(app)
           .post('/api/chat')
@@ -258,7 +290,10 @@ test('POST /api/chat SSE crewai: success + done', { concurrency: false }, async 
 
         assert.equal(response.status, 200);
         assert.equal(response.headers['x-orchestration-path'], 'orchestrator');
-        assert.match(response.text, /data: Bonjour depuis orchestrateur/);
+        assert.match(response.text, /event: agent_status/);
+        assert.match(response.text, /data: Cadrage initial\./);
+        assert.match(response.text, /data: Plan en 3 etapes\./);
+        assert.match(response.text, /data: Strategie finale\./);
         assert.match(response.text, /event: done/);
       },
     );
@@ -301,7 +336,7 @@ test('POST /api/chat hybrid: orchestrator down => fallback legacy + done', { con
         async (url) => {
           const target = String(url);
 
-          if (target.includes('/internal/orchestrate')) {
+          if (target.includes('/internal/orchestrate/stream')) {
             throw new Error('orchestrator down');
           }
 
