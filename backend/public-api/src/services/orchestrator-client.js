@@ -1,6 +1,7 @@
 import { env } from '../config/env.js';
 import { AppError } from '../utils/errors.js';
 import { mintInternalToken } from './internal-auth.service.js';
+import { prepareChatMessagesForOrchestrator } from '../utils/chat-attachments.js';
 
 const ORCHESTRATOR_PATH = '/internal/orchestrate';
 const ORCHESTRATOR_STREAM_PATH = '/internal/orchestrate/stream';
@@ -44,6 +45,7 @@ export const invokeOrchestrator = async ({ messages, requestId, userSub }) => {
     requestId,
     scope: 'orchestrate:invoke',
   });
+  const preparedMessages = prepareChatMessagesForOrchestrator(messages);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.orchestratorTimeoutMs);
@@ -56,7 +58,7 @@ export const invokeOrchestrator = async ({ messages, requestId, userSub }) => {
         Authorization: `Bearer ${token}`,
         'X-Request-Id': requestId,
       },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ messages: preparedMessages }),
       signal: controller.signal,
     });
 
@@ -97,6 +99,7 @@ export const streamOrchestrator = async function* ({ messages, requestId, userSu
     requestId,
     scope: 'orchestrate:invoke',
   });
+  const preparedMessages = prepareChatMessagesForOrchestrator(messages);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), env.orchestratorTimeoutMs);
@@ -109,7 +112,7 @@ export const streamOrchestrator = async function* ({ messages, requestId, userSu
         Authorization: `Bearer ${token}`,
         'X-Request-Id': requestId,
       },
-      body: JSON.stringify({ messages }),
+      body: JSON.stringify({ messages: preparedMessages }),
       signal: controller.signal,
     });
 

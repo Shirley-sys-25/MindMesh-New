@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { importFresh } from './helpers/load-module.js';
 
 const retentionServicePath = path.resolve(process.cwd(), 'backend/public-api/src/services/db-retention.service.js');
+const databaseServicePath = path.resolve(process.cwd(), 'backend/public-api/src/services/database.service.js');
 const envPath = path.resolve(process.cwd(), 'backend/public-api/src/config/env.js');
 
 const withEnvPatch = async (patch, callback) => {
@@ -64,5 +65,18 @@ test('db retention scheduler triggers immediate cleanup', async () => {
     retention.stopDbRetentionScheduler();
 
     assert.ok(callCount >= 2);
+  });
+});
+
+test('database close marks status closed', async () => {
+  await withEnvPatch({ databaseEnabled: true }, async () => {
+    const database = await importFresh(databaseServicePath);
+
+    await database.closeDatabase();
+
+    const status = database.getDatabaseStatus();
+    assert.equal(status.status, 'closed');
+    assert.equal(status.initialized, false);
+    assert.equal(status.initializing, false);
   });
 });

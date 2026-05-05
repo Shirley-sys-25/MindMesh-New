@@ -2,19 +2,25 @@
 import { 
   Plus, Target, Trophy, Brain, Send, Mic, Share2, Download, Play, Code, Eye,
   Terminal, Activity, Globe, Search, Zap, LayoutDashboard,
-  ShieldCheck, Cpu, Sun, Moon, AlertTriangle
+  ShieldCheck, Cpu, Sun, Moon, AlertTriangle, Paperclip, X, FileText, Image
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useSessionStateSync } from './hooks/useSessionStateSync';
+import { useBackendSnapshot } from './hooks/useBackendSnapshot';
+import { CHAT_ATTACHMENT_ACCEPT, useChatAttachments, type ChatAttachment } from './hooks/useChatAttachments';
 
 interface Agent {
   id: string; name: string; role: string; icon: any;
 }
 
 interface Message {
-  role: 'user' | 'assistant' | 'system'; content: string; tone?: 'error';
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  tone?: 'error';
+  attachments?: ChatAttachment[];
 }
 
 interface SessionLog {
@@ -24,27 +30,9 @@ interface SessionLog {
   tone: 'info' | 'success' | 'warn';
 }
 
-interface BackendSnapshot {
-  health: 'ok' | 'down' | 'unknown';
-  ready: 'ready' | 'degraded' | 'down' | 'unknown';
-  mode: string;
-  databaseStatus: string;
-  reason: string;
-  updatedAt: number | null;
-}
-
 interface WorkspaceNotice {
   tone: 'info' | 'success' | 'warn';
   text: string;
-}
-
-interface MetricsSnapshot {
-  httpRequestsTotal: number | null;
-  orchestratorCallsTotal: number | null;
-  providerErrorsTotal: number | null;
-  authFailuresTotal: number | null;
-  error: string | null;
-  updatedAt: number | null;
 }
 
 const preferredRecorderMimeTypes = [
@@ -144,24 +132,6 @@ const readChatErrorPayload = async (response: Response): Promise<{ code: string;
   return { code, message };
 };
 
-const readPromCounterValue = (metricsRaw: string, metricName: string): number | null => {
-  const pattern = new RegExp(`^${metricName}(?:\\{[^}]*\\})?\\s+(-?\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?)$`, 'gim');
-  let total = 0;
-  let found = false;
-  let match: RegExpExecArray | null = pattern.exec(metricsRaw);
-
-  while (match) {
-    const parsed = Number(match[1]);
-    if (Number.isFinite(parsed)) {
-      total += parsed;
-      found = true;
-    }
-    match = pattern.exec(metricsRaw);
-  }
-
-  return found ? total : null;
-};
-
 const SESSION_STORAGE_KEY = 'mindmesh.session_id';
 
 const createSessionId = (): string => {
@@ -183,6 +153,30 @@ const readOrCreateSessionId = (): string => {
   return generated;
 };
 
+const BASIC_GREETING_WORDS = new Set(['bonjour', 'salut', 'hello', 'coucou', 'hi', 'hey']);
+
+const normalizeForObjectiveCapture = (value: string): string =>
+  value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s'-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const captureObjectiveFromMessage = (value: string): string | null => {
+  const compact = normalizeForObjectiveCapture(value);
+  if (!compact) return null;
+
+  const words = compact.split(' ').filter(Boolean);
+  if (words.length < 4 || compact.length < 20) return null;
+
+  const greetingOnly = words.every((word) => BASIC_GREETING_WORDS.has(word));
+  if (greetingOnly) return null;
+
+  return value.replace(/\s+/g, ' ').trim();
+};
+
 export default function App() {
   const { signOut, openUserProfile } = useClerk();
   const { getToken } = useAuth();
@@ -199,30 +193,14 @@ export default function App() {
   const [objectiveProgress, setObjectiveProgress] = useState(0);
   const [objectiveStep, setObjectiveStep] = useState(0);
   const [currentObjective, setCurrentObjective] = useState<string | null>(null);
+  const [sessionSummary, setSessionSummary] = useState<string | null>(null);
   const [securityScore, setSecurityScore] = useState(99.8);
   const [isExecutingWorkspace, setIsExecutingWorkspace] = useState(false);
   const [workspaceNotice, setWorkspaceNotice] = useState<WorkspaceNotice | null>(null);
-  const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
   const [agentStatuses, setAgentStatuses] = useState<Record<string, 'idle' | 'working'>>({
     africonnect: 'idle',
     analyste_marche: 'idle',
     stratege_seo: 'idle',
-  });
-  const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot>({
-    health: 'unknown',
-    ready: 'unknown',
-    mode: 'unknown',
-    databaseStatus: 'unknown',
-    reason: 'Aucune synchronisation pour le moment.',
-    updatedAt: null,
-  });
-  const [metricsSnapshot, setMetricsSnapshot] = useState<MetricsSnapshot>({
-    httpRequestsTotal: null,
-    orchestratorCallsTotal: null,
-    providerErrorsTotal: null,
-    authFailuresTotal: null,
-    error: null,
-    updatedAt: null,
   });
   const [sessionId, setSessionId] = useState(() => readOrCreateSessionId());
 
@@ -233,6 +211,15 @@ export default function App() {
   const recorderMimeTypeRef = useRef<string>('audio/webm');
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
   const workspaceNoticeTimeoutRef = useRef<number | null>(null);
+
+  const {
+    attachments,
+    attachmentInputRef,
+    clearAttachments,
+    handleAttachmentSelection,
+    isPreparingAttachments,
+    removeAttachment,
+  } = useChatAttachments();
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', isDarkMode ? 'dark' : 'light');
@@ -265,6 +252,37 @@ export default function App() {
     }
   }, [getToken]);
 
+  const getMetricsHeaders = useCallback(async () => {
+    const headers: Record<string, string> = {};
+    if (METRICS_ADMIN_TOKEN) {
+      headers.Authorization = 'Bearer ' + METRICS_ADMIN_TOKEN;
+    }
+    return headers;
+  }, [METRICS_ADMIN_TOKEN]);
+
+  const { loadSessionState, persistSessionState, sessionStateHydratedRef } = useSessionStateSync({
+    apiBaseUrl: API_BASE_URL,
+    sessionId,
+    currentView,
+    activeTab,
+    currentObjective,
+    sessionSummary,
+    objectiveStep,
+    objectiveProgress,
+    getAuthorizationHeaders,
+    setCurrentObjective,
+    setSessionSummary,
+    setCurrentView,
+    setActiveTab,
+    setObjectiveStep,
+    setObjectiveProgress,
+  });
+
+  const { backendSnapshot, isRefreshingSnapshot, metricsSnapshot, refreshBackendSnapshot } = useBackendSnapshot({
+    apiBaseUrl: API_BASE_URL,
+    getMetricsHeaders,
+  });
+
   const resetAgentStatuses = () => {
     setAgentStatuses({
       africonnect: 'idle',
@@ -293,8 +311,22 @@ export default function App() {
               role: item.role === 'assistant' || item.role === 'system' ? item.role : 'user',
               content: typeof item.content === 'string' ? item.content : '',
               tone: item.tone === 'error' ? 'error' : undefined,
+              attachments: Array.isArray(item.attachments)
+                ? item.attachments
+                    .filter((attachment: any) => attachment && typeof attachment === 'object')
+                    .map((attachment: any) => ({
+                      id: typeof attachment.id === 'string' ? attachment.id : '',
+                      name: typeof attachment.name === 'string' ? attachment.name : 'fichier',
+                      mimeType: typeof attachment.mimeType === 'string' ? attachment.mimeType : 'application/octet-stream',
+                      kind: attachment.kind === 'image' ? 'image' : 'document',
+                      size: Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : 0,
+                      dataUrl: typeof attachment.dataUrl === 'string' ? attachment.dataUrl : undefined,
+                      textPreview: typeof attachment.textPreview === 'string' ? attachment.textPreview : undefined,
+                    }))
+                    .filter((attachment: ChatAttachment) => attachment.name.trim().length > 0)
+                : undefined,
             }))
-            .filter((item: Message) => item.content.trim().length > 0)
+            .filter((item: Message) => item.content.trim().length > 0 || (item.attachments?.length || 0) > 0)
         : [];
 
       setMessages(loadedMessages);
@@ -302,6 +334,17 @@ export default function App() {
       console.error('Historique chat indisponible:', error);
     }
   }, [API_BASE_URL, getAuthorizationHeaders, sessionId]);
+
+  useEffect(() => {
+    if (!sessionStateHydratedRef.current) return;
+
+    void persistSessionState({
+      currentObjective,
+      sessionSummary,
+      objectiveStep,
+      objectiveProgress,
+    });
+  }, [activeTab, currentObjective, currentView, objectiveProgress, objectiveStep, persistSessionState, sessionSummary]);
 
   const evaluatePromptSecurity = (prompt: string): number => {
     if (!prompt.trim()) return 99.8;
@@ -412,126 +455,10 @@ export default function App() {
     };
   }, []);
 
-  const getMetricsHeaders = useCallback(async () => {
-    const headers: Record<string, string> = {};
-    if (METRICS_ADMIN_TOKEN) {
-      headers.Authorization = 'Bearer ' + METRICS_ADMIN_TOKEN;
-    }
-    return headers;
-  }, [METRICS_ADMIN_TOKEN]);
-
-  const refreshBackendSnapshot = useCallback(async () => {
-    setIsRefreshingSnapshot(true);
-
-    try {
-      const [healthResponse, readyResponse] = await Promise.all([
-        fetch(`${API_BASE_URL}/healthz`),
-        fetch(`${API_BASE_URL}/readyz`),
-      ]);
-
-      let healthPayload: any = null;
-      let readyPayload: any = null;
-
-      if (healthResponse.ok) {
-        try {
-          healthPayload = await healthResponse.json();
-        } catch {
-          healthPayload = null;
-        }
-      }
-
-      try {
-        readyPayload = await readyResponse.json();
-      } catch {
-        readyPayload = null;
-      }
-
-      const health: BackendSnapshot['health'] =
-        healthResponse.ok && healthPayload?.status === 'ok' ? 'ok' : 'down';
-
-      const ready: BackendSnapshot['ready'] = (() => {
-        if (!readyResponse.ok) return 'down';
-        if (readyPayload?.status === 'ready' && readyPayload?.degraded) return 'degraded';
-        if (readyPayload?.status === 'ready') return 'ready';
-        return 'degraded';
-      })();
-
-      setBackendSnapshot({
-        health,
-        ready,
-        mode: typeof readyPayload?.mode === 'string' ? readyPayload.mode : 'unknown',
-        databaseStatus:
-          (typeof readyPayload?.database?.status === 'string' && readyPayload.database.status) ||
-          (typeof healthPayload?.database?.status === 'string' && healthPayload.database.status) ||
-          'unknown',
-        reason:
-          (typeof readyPayload?.reason === 'string' && readyPayload.reason) ||
-          (ready === 'ready' ? 'Tous les checks backend sont au vert.' : 'Backend degrade ou indisponible.'),
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      console.error('Snapshot backend indisponible:', error);
-      setBackendSnapshot({
-        health: 'down',
-        ready: 'down',
-        mode: 'unknown',
-        databaseStatus: 'unknown',
-        reason: 'API locale inaccessible. Verifie le serveur backend.',
-        updatedAt: Date.now(),
-      });
-    }
-
-    try {
-      const metricsHeaders = await getMetricsHeaders();
-      const metricsResponse = await fetch(`${API_BASE_URL}/metrics`, {
-        headers: metricsHeaders,
-      });
-
-      if (!metricsResponse.ok) {
-        const statusHint =
-          metricsResponse.status === 401
-            ? 'Acces /metrics protege (configure VITE_METRICS_ADMIN_TOKEN).'
-            : `Impossible de lire /metrics (${metricsResponse.status}).`;
-        setMetricsSnapshot((prev) => ({
-          ...prev,
-          error: statusHint,
-          updatedAt: Date.now(),
-        }));
-      } else {
-        const metricsRaw = await metricsResponse.text();
-        setMetricsSnapshot({
-          httpRequestsTotal: readPromCounterValue(metricsRaw, 'mindmesh_http_requests_total'),
-          orchestratorCallsTotal: readPromCounterValue(metricsRaw, 'mindmesh_orchestrator_calls_total'),
-          providerErrorsTotal: readPromCounterValue(metricsRaw, 'mindmesh_provider_errors_total'),
-          authFailuresTotal: readPromCounterValue(metricsRaw, 'mindmesh_auth_failures_total'),
-          error: null,
-          updatedAt: Date.now(),
-        });
-      }
-    } catch (error) {
-      console.error('Snapshot metrics indisponible:', error);
-      setMetricsSnapshot((prev) => ({
-        ...prev,
-        error: 'Lecture metrics impossible (reseau ou credentials).',
-        updatedAt: Date.now(),
-      }));
-    } finally {
-      setIsRefreshingSnapshot(false);
-    }
-  }, [API_BASE_URL, getMetricsHeaders]);
-
-  useEffect(() => {
-    void refreshBackendSnapshot();
-    const interval = window.setInterval(() => {
-      void refreshBackendSnapshot();
-    }, 30000);
-
-    return () => window.clearInterval(interval);
-  }, [refreshBackendSnapshot]);
-
   useEffect(() => {
     void loadChatHistory();
-  }, [loadChatHistory]);
+    void loadSessionState();
+  }, [loadChatHistory, loadSessionState]);
 
   const formatSnapshotTime = (timestamp: number | null) => {
     if (!timestamp) return '--';
@@ -713,9 +640,12 @@ export default function App() {
     setSessionLogs([]);
     setLatencyMs(null);
     resetAgentStatuses();
+    setCurrentView('chat');
+    setActiveTab('preview');
     setObjectiveProgress(0);
     setObjectiveStep(0);
     setCurrentObjective(null);
+    setSessionSummary(null);
     setSecurityScore(99.8);
 
     const nextSessionId = createSessionId();
@@ -727,33 +657,32 @@ export default function App() {
       }
     }
     setSessionId(nextSessionId);
+    void persistSessionState({
+      sessionId: nextSessionId,
+      currentObjective: null,
+      sessionSummary: null,
+      objectiveStep: 0,
+      objectiveProgress: 0,
+      currentView: 'chat',
+      activeTab: 'preview',
+    });
   };
 
   const sendPrompt = async (promptInput: string) => {
     const trimmedMessage = promptInput.trim();
-    if (!trimmedMessage || isLoading) return;
+    const selectedAttachments = attachments.map((attachment) => ({ ...attachment }));
+    const hasAttachments = selectedAttachments.length > 0;
+    if ((!trimmedMessage && !hasAttachments) || isLoading || isPreparingAttachments) return;
 
     const compactPrompt = trimmedMessage.replace(/\s+/g, ' ').trim();
-    const normalizedPrompt = compactPrompt
-      .toLowerCase()
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
 
-    if (!currentObjective) {
-      const hasObjectiveIntent = ['objectif', 'analyser', 'je veux', 'lancer'].some((keyword) =>
-        normalizedPrompt.includes(keyword)
-      );
-      const fallbackObjectiveLabel = (() => {
-        const firstWords = compactPrompt.split(/\s+/).filter(Boolean).slice(0, 8).join(' ');
-        if (!firstWords) return compactPrompt;
-        return compactPrompt.split(/\s+/).filter(Boolean).length > 8 ? firstWords + '...' : firstWords;
-      })();
+    let nextCurrentObjective = currentObjective;
 
-      if (hasObjectiveIntent) {
-        const objectiveLabel = compactPrompt.length > 25 ? compactPrompt.slice(0, 25) + '...' : compactPrompt;
-        setCurrentObjective(objectiveLabel);
-      } else {
-        setCurrentObjective(fallbackObjectiveLabel);
+    if (!currentObjective && compactPrompt) {
+      const capturedObjective = captureObjectiveFromMessage(compactPrompt);
+      if (capturedObjective) {
+        nextCurrentObjective = capturedObjective;
+        setCurrentObjective(nextCurrentObjective);
       }
     }
 
@@ -767,16 +696,29 @@ export default function App() {
       setLatencyMs(Date.now() - requestStartedAt);
     };
 
-    const userMessage: Message = { role: 'user', content: trimmedMessage };
+    const userMessage: Message = {
+      role: 'user',
+      content: trimmedMessage,
+      attachments: hasAttachments ? selectedAttachments : undefined,
+    };
     setSecurityScore(evaluatePromptSecurity(trimmedMessage));
     const nextMessages = [...messages, userMessage];
+    const nextObjectiveStep = Math.min(objectiveStep + 1, 5);
+    const nextObjectiveProgress = Math.min(objectiveProgress + 20, 100);
 
     setMessages(nextMessages);
+    clearAttachments();
     resetAgentStatuses();
     setMessage('');
     setIsLoading(true);
-    setObjectiveStep((prev) => Math.min(prev + 1, 5));
-    setObjectiveProgress((prev) => Math.min(prev + 20, 100));
+    setObjectiveStep(nextObjectiveStep);
+    setObjectiveProgress(nextObjectiveProgress);
+    void persistSessionState({
+      currentObjective: nextCurrentObjective,
+      sessionSummary,
+      objectiveStep: nextObjectiveStep,
+      objectiveProgress: nextObjectiveProgress,
+    });
 
     pushSessionLog('Awaiting sync...');
     pushSessionLog('Routing to orchestrator...');
@@ -1168,6 +1110,11 @@ export default function App() {
                   <Trophy className="w-3 h-3 text-purple-400/40" />
                   <span className="font-medium">{completedSteps} sur 5 etapes completees</span>
                 </div>
+                {sessionSummary && (
+                  <div className={`mt-3 pt-3 border-t relative z-10 text-[11px] leading-relaxed ${isDarkMode ? 'border-white/10 text-white/60' : 'border-purple-100 text-purple-950/70'}`}>
+                    {sessionSummary}
+                  </div>
+                )}
               </motion.div>
             ) : (
               <p className="text-xs text-gray-400 italic mt-2">Aucun objectif en cours</p>
@@ -1423,6 +1370,35 @@ export default function App() {
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>{(m.content || '').replace(/\\n/g, '\n')}</ReactMarkdown>
                       )}
                     </div>
+
+                    {m.attachments && m.attachments.length > 0 && (
+                      <div className={`mt-2 flex max-w-[80%] flex-wrap gap-2 ${isUserMessage ? 'justify-end' : 'justify-start'}`}>
+                        {m.attachments.map((attachment) => (
+                          <div
+                            key={attachment.id}
+                            className={`flex items-center gap-3 rounded-2xl border px-3 py-2 text-xs ${isDarkMode ? 'border-white/10 bg-black/20 text-gray-200' : 'border-purple-100 bg-white text-slate-700'}`}
+                          >
+                            {attachment.kind === 'image' && attachment.dataUrl ? (
+                              <img
+                                src={attachment.dataUrl}
+                                alt={attachment.name}
+                                className="h-10 w-10 rounded-xl object-cover border border-white/10"
+                              />
+                            ) : (
+                              <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${isDarkMode ? 'bg-white/10 text-purple-300' : 'bg-purple-50 text-purple-600'}`}>
+                                {attachment.kind === 'image' ? <Image className="h-4 w-4" /> : <FileText className="h-4 w-4" />}
+                              </div>
+                            )}
+                            <div className="min-w-0">
+                              <div className="truncate font-semibold">{attachment.name}</div>
+                              <div className={isDarkMode ? 'text-white/40' : 'text-slate-500'}>
+                                {attachment.kind === 'image' ? 'Image' : 'Document'}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                     
                     {isUserMessage && (
                       <div className="w-10 h-10 rounded-full bg-gray-900 flex items-center justify-center border border-white/10 overflow-hidden shrink-0 shadow-lg">
@@ -1466,48 +1442,130 @@ export default function App() {
               className="w-full relative group"
             >
               <div className={`absolute -inset-0.5 bg-gradient-to-r from-purple-500/20 to-pink-500/20 rounded-[32px] blur opacity-0 group-focus-within:opacity-100 transition-opacity duration-700`} />
-              <div className={`relative glass-heavy h-20 rounded-[32px] border ${isDarkMode ? 'border-white/5 bg-black/20' : 'border-purple-200 bg-white/80'} flex items-center p-2 group-focus-within:border-purple-400 transition-all duration-300 shadow-2xl`}>
-                
-                <button 
-                  type="button"
-                  onClick={toggleRecording}
-                  className={`h-full px-6 flex items-center justify-center transition-colors relative ${
-                    isRecording 
-                      ? 'text-red-500' 
-                      : `${isDarkMode ? 'text-white/40 hover:text-white' : 'text-purple-900/40 hover:text-purple-600'}`
-                  }`}
-                >
-                  {isRecording && (
-                    <div className="absolute w-6 h-6 bg-red-500/30 rounded-full animate-ping" />
-                  )}
-                  <Mic className="w-5 h-5 relative z-10" />
-                </button>
+              <input
+                ref={attachmentInputRef}
+                type="file"
+                accept={CHAT_ATTACHMENT_ACCEPT}
+                multiple
+                className="hidden"
+                onChange={async (e) => handleAttachmentSelection(e.target.files)}
+              />
 
-                <input 
-                  type="text" 
-                  value={message}
-                  onChange={(e) => {
-                    const nextInput = e.target.value;
-                    setMessage(nextInput);
-                    setSecurityScore(evaluatePromptSecurity(nextInput));
-                  }}
-                  onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
-                  placeholder={isRecording ? "Écoute en cours (Cliquez pour arrêter)..." : "Instruire MindMesh..."}
-                  disabled={isRecording}
-                  className={`flex-1 bg-transparent border-none outline-none text-lg ${isDarkMode ? 'placeholder:text-white/40 text-white' : 'placeholder:text-slate-500 text-slate-800'} px-2 font-medium w-full`}
-                />
-                
-                <button 
-                  type="button"
-                  onClick={handleSend}
-                  disabled={isLoading || !message.trim() || isRecording}
-                  className={`w-14 h-14 gradient-vibrant rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/40 transition-all duration-300 shrink-0 ${
-                    isLoading || !message.trim() || isRecording ? 'opacity-50 scale-100 cursor-not-allowed' : 'hover:scale-105 active:scale-95'
-                  }`}
-                >
-                  <Send className="w-5 h-5 text-white" />
-                </button>
+              {attachments.length > 0 && (
+                <div className={`mb-2 rounded-[24px] border px-3 py-2 backdrop-blur-xl shadow-lg ${isDarkMode ? 'border-white/10 bg-black/20' : 'border-purple-200 bg-white/85'}`}>
+                  <div className={`mb-2 flex items-center justify-between text-[9px] font-black uppercase tracking-[0.22em] ${isDarkMode ? 'text-white/30' : 'text-purple-950/45'}`}>
+                    <span>Pièces jointes</span>
+                    <button
+                      type="button"
+                      onClick={clearAttachments}
+                      className={`${isDarkMode ? 'text-white/45 hover:text-white' : 'text-purple-900/45 hover:text-purple-700'} transition-colors`}
+                    >
+                      Tout retirer
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    {attachments.map((attachment) => (
+                      <div
+                        key={attachment.id}
+                        className={`flex max-w-full items-center gap-2 rounded-xl border px-2.5 py-1.5 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-100 bg-white'}`}
+                      >
+                        <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg ${isDarkMode ? 'bg-white/10 text-purple-300' : 'bg-purple-50 text-purple-600'}`}>
+                          {attachment.kind === 'image' ? <Image className="h-3.5 w-3.5" /> : <FileText className="h-3.5 w-3.5" />}
+                        </div>
+                        <div className="min-w-0">
+                          <div className={`max-w-[180px] truncate text-[11px] font-semibold leading-none ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{attachment.name}</div>
+                          <div className={`mt-0.5 text-[9px] leading-none ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>
+                            {attachment.kind === 'image' ? 'Image' : 'Document'} · {Math.max(1, Math.round(attachment.size / 1024))} KB
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(attachment.id)}
+                          className={`rounded-full p-0.5 transition-colors ${isDarkMode ? 'text-white/40 hover:bg-white/10 hover:text-white' : 'text-slate-400 hover:bg-purple-50 hover:text-purple-700'}`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="group flex w-full items-end gap-3">
+                <div className={`relative flex min-h-20 flex-1 items-center rounded-[32px] border p-2 glass-heavy ${isDarkMode ? 'border-white/5 bg-black/20' : 'border-purple-200 bg-white/80'} group-focus-within:border-purple-400 transition-all duration-300 shadow-2xl`}>
+                  <input 
+                    id="chat-attachment-input"
+                    ref={attachmentInputRef}
+                    type="file"
+                    accept={CHAT_ATTACHMENT_ACCEPT}
+                    multiple
+                    className="hidden"
+                    onChange={async (e) => handleAttachmentSelection(e.target.files)}
+                  />
+
+                  <label
+                    htmlFor="chat-attachment-input"
+                    aria-disabled={isRecording || isPreparingAttachments}
+                    className={`h-full px-4 flex items-center justify-center transition-colors relative ${
+                      isDarkMode ? 'text-white/40 hover:text-white' : 'text-purple-900/40 hover:text-purple-600'
+                    } ${(isRecording || isPreparingAttachments) ? 'pointer-events-none opacity-50' : 'cursor-pointer'}`}
+                    title="Ajouter un document ou une photo"
+                  >
+                    {attachments.length > 0 && (
+                      <span className={`absolute right-1 top-1 min-w-5 rounded-full px-1.5 py-0.5 text-[9px] font-black leading-none ${isDarkMode ? 'bg-white text-slate-900' : 'bg-slate-900 text-white'}`}>
+                        {attachments.length}
+                      </span>
+                    )}
+                    <Paperclip className="w-5 h-5 relative z-10" />
+                  </label>
+
+                  <button 
+                    type="button"
+                    onClick={toggleRecording}
+                    className={`h-full px-4 flex items-center justify-center transition-colors relative ${
+                      isRecording 
+                        ? 'text-red-500' 
+                        : `${isDarkMode ? 'text-white/40 hover:text-white' : 'text-purple-900/40 hover:text-purple-600'}`
+                    }`}
+                  >
+                    {isRecording && (
+                      <div className="absolute w-6 h-6 bg-red-500/30 rounded-full animate-ping" />
+                    )}
+                    <Mic className="w-5 h-5 relative z-10" />
+                  </button>
+
+                  <input 
+                    type="text" 
+                    value={message}
+                    onChange={(e) => {
+                      const nextInput = e.target.value;
+                      setMessage(nextInput);
+                      setSecurityScore(evaluatePromptSecurity(nextInput));
+                    }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
+                    placeholder={isRecording ? "Écoute en cours (Cliquez pour arrêter)..." : "Instruire MindMesh..."}
+                    disabled={isRecording || isPreparingAttachments}
+                    className={`flex-1 bg-transparent border-none outline-none text-lg ${isDarkMode ? 'placeholder:text-white/40 text-white' : 'placeholder:text-slate-500 text-slate-800'} px-2 font-medium w-full`}
+                  />
+                  
+                  <button 
+                    type="button"
+                    onClick={handleSend}
+                    disabled={isLoading || (!message.trim() && attachments.length === 0) || isRecording || isPreparingAttachments}
+                    className={`w-14 h-14 gradient-vibrant rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/40 transition-all duration-300 shrink-0 ${
+                      isLoading || (!message.trim() && attachments.length === 0) || isRecording || isPreparingAttachments ? 'opacity-50 scale-100 cursor-not-allowed' : 'hover:scale-105 active:scale-95'
+                    }`}
+                  >
+                    <Send className="w-5 h-5 text-white" />
+                  </button>
+                </div>
               </div>
+
+              {isPreparingAttachments && (
+                <div className={`mt-2 text-xs font-medium ${isDarkMode ? 'text-purple-200' : 'text-purple-700'}`}>
+                  Préparation des pièces jointes...
+                </div>
+              )}
             </motion.div>
             </SignedIn>
           </div>

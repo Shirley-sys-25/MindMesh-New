@@ -12,6 +12,7 @@ const state = {
   initError: null,
   pool: null,
   target: null,
+  closed: false,
 };
 
 const clampText = (value, max = 400) => {
@@ -39,6 +40,45 @@ const toHistoryLimit = (value, fallback = 100) => {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.max(1, Math.min(500, parsed));
+};
+
+const toBoundedPercent = (value, fallback = 0) => {
+  const parsed = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.min(100, parsed));
+};
+
+const normalizeOptionalText = (value, max = 1000) => {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  return text.length > max ? text.slice(0, max) : text;
+};
+
+const normalizeWorkspaceValue = (value, fallback = null) => {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return fallback;
+  return text;
+};
+
+const normalizeSessionStateText = (value, max = 2000) => {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  return text.length > max ? text.slice(0, max) : text;
+};
+
+const buildSessionSummary = ({ currentObjective, userMessage, assistantMessage, messageCount }) => {
+  const objective = normalizeOptionalText(currentObjective, 120);
+  const userSnippet = clampPreservingFormatting(userMessage, 120);
+  const assistantSnippet = clampPreservingFormatting(assistantMessage, 160);
+  const exchangeCount = Math.max(1, Math.ceil(Math.max(0, Number(messageCount) || 0) / 2));
+
+  const parts = [];
+  if (objective) parts.push(`Objectif: ${objective}.`);
+  if (userSnippet) parts.push(`Demande récente: ${userSnippet}.`);
+  if (assistantSnippet) parts.push(`Réponse récente: ${assistantSnippet}.`);
+  parts.push(`${exchangeCount} échange(s) enregistrés.`);
+
+  return parts.join(' ');
 };
 
 export const mapChatHistoryRows = (rows) => {
@@ -90,6 +130,7 @@ const closePool = async (pool) => {
 
 const getPublicDatabaseState = () => {
   if (!env.databaseEnabled) return 'disabled';
+  if (state.closed) return 'closed';
   if (state.enabled && state.pool) return 'ready';
   if (state.initializing) return 'initializing';
   if (state.initError) return 'error';
@@ -106,6 +147,7 @@ export const initializeDatabase = async () => {
     state.enabled = false;
     state.target = null;
     state.initError = null;
+    state.closed = true;
     stopDbRetentionScheduler();
     await closePool(previousPool);
     logger.info({ database_enabled: false }, 'database_disabled');
@@ -117,6 +159,7 @@ export const initializeDatabase = async () => {
 
   state.initialized = true;
   state.initializing = true;
+  state.closed = false;
   state.target = redactDatabaseUrl(env.databaseUrl);
 
   const previousPool = state.pool;
@@ -261,6 +304,12 @@ export const checkDatabaseReadiness = async () => {
 export const closeDatabase = async () => {
   stopDbRetentionScheduler();
   const pool = state.pool;
+  state.initialized = false;
+  state.initializing = false;
+  state.initPromise = null;
+  state.initError = null;
+  state.target = null;
+  state.closed = true;
   state.pool = null;
   state.enabled = false;
   if (!pool) return;
@@ -364,6 +413,134 @@ export const getChatHistory = async ({ sessionId, userSub, limit = 100 }) => {
     count: result.rows.length,
   };
 };
+
+export const upsertSessionState = async ({
+  sessionId,
+  userSub,
+  currentObjective,
+  sessionSummary,
+  currentView,
+  activeTab,
+  objectiveStep = 0,
+  objectiveProgress = 0,
+}) => {
+  if (!isReady()) return;
+
+  const pool = state.pool;
+  if (!pool) return;
+
+  const resolvedSessionId = toSessionKey(sessionId);
+  if (!resolvedSessionId) return;
+
+  await pool
+    .query(
+      `INSERT INTO session_states
+       (session_id, user_sub, current_objective, session_summary, current_view, active_tab, objective_step, objective_progress, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (session_id)
+       DO UPDATE SET
+         user_sub = EXCLUDED.user_sub,
+         current_objective = COALESCE(EXCLUDED.current_objective, session_states.current_objective),
+         session_summary = COALESCE(EXCLUDED.session_summary, session_states.session_summary),
+         current_view = COALESCE(EXCLUDED.current_view, session_states.current_view),
+         active_tab = COALESCE(EXCLUDED.active_tab, session_states.active_tab),
+         objective_step = COALESCE(EXCLUDED.objective_step, session_states.objective_step),
+         objective_progress = COALESCE(EXCLUDED.objective_progress, session_states.objective_progress),
+         updated_at = NOW()`,
+      [
+        resolvedSessionId,
+        userSub || null,
+        normalizeOptionalText(currentObjective, 1000),
+        normalizeSessionStateText(sessionSummary, 2000),
+        normalizeWorkspaceValue(currentView),
+        normalizeWorkspaceValue(activeTab),
+        Number.isFinite(Number(objectiveStep)) ? toBoundedPercent(objectiveStep, 0) : null,
+        Number.isFinite(Number(objectiveProgress)) ? toBoundedPercent(objectiveProgress, 0) : null,
+      ],
+    )
+    .catch((error) => {
+      logger.warn({ err: error, session_id: resolvedSessionId }, 'database_upsert_session_state_failed');
+    });
+};
+
+export const getSessionState = async ({ sessionId, userSub }) => {
+  if (!isReady()) {
+    return {
+      sessionId: toSessionKey(sessionId) || toSessionKey(userSub),
+      currentObjective: null,
+      sessionSummary: null,
+      currentView: null,
+      activeTab: null,
+      objectiveStep: 0,
+      objectiveProgress: 0,
+    };
+  }
+
+  const pool = state.pool;
+  if (!pool) {
+    return {
+      sessionId: toSessionKey(sessionId) || toSessionKey(userSub),
+      currentObjective: null,
+      sessionSummary: null,
+      currentView: null,
+      activeTab: null,
+      objectiveStep: 0,
+      objectiveProgress: 0,
+    };
+  }
+
+  const resolvedSessionId = toSessionKey(sessionId) || toSessionKey(userSub);
+  if (!resolvedSessionId) {
+    return {
+      sessionId: null,
+      currentObjective: null,
+      sessionSummary: null,
+      currentView: null,
+      activeTab: null,
+      objectiveStep: 0,
+      objectiveProgress: 0,
+    };
+  }
+
+  const hasUserSub = typeof userSub === 'string' && userSub.trim().length > 0;
+  const queryText = hasUserSub
+    ? `SELECT session_id, current_objective, session_summary, current_view, active_tab, objective_step, objective_progress
+       FROM session_states
+       WHERE session_id = $1 AND user_sub = $2
+       LIMIT 1`
+    : `SELECT session_id, current_objective, session_summary, current_view, active_tab, objective_step, objective_progress
+       FROM session_states
+       WHERE session_id = $1
+       LIMIT 1`;
+  const queryParams = hasUserSub ? [resolvedSessionId, userSub.trim()] : [resolvedSessionId];
+
+  const result = await pool.query(queryText, queryParams);
+  const row = result.rows?.[0] || null;
+
+  if (!row) {
+    return {
+      sessionId: resolvedSessionId,
+      currentObjective: null,
+      sessionSummary: null,
+      currentView: null,
+      activeTab: null,
+      objectiveStep: 0,
+      objectiveProgress: 0,
+    };
+  }
+
+  return {
+    sessionId: row.session_id || resolvedSessionId,
+    currentObjective: row.current_objective || null,
+    sessionSummary: row.session_summary || null,
+    currentView: normalizeWorkspaceValue(row.current_view),
+    activeTab: normalizeWorkspaceValue(row.active_tab),
+    objectiveStep: toBoundedPercent(row.objective_step, 0),
+    objectiveProgress: toBoundedPercent(row.objective_progress, 0),
+  };
+};
+
+export const buildSessionSummaryText = buildSessionSummary;
 
 export const recordTranscribeRequest = ({
   requestId,

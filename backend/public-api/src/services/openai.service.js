@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { env } from '../config/env.js';
 import { AppError } from '../utils/errors.js';
+import { prepareChatMessagesForLegacyProvider } from '../utils/chat-attachments.js';
 
 const buildOpenAiClient = () =>
   new OpenAI({
@@ -21,10 +22,11 @@ export const createLegacyChatStream = async (messages) => {
   }
 
   const openai = buildOpenAiClient();
+  const preparedMessages = prepareChatMessagesForLegacyProvider(messages);
 
   return openai.chat.completions.create({
     model: env.openaiModel,
-    messages: [systemPrompt, ...messages],
+    messages: [systemPrompt, ...preparedMessages],
     stream: true,
   });
 };

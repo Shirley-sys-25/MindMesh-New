@@ -7,11 +7,12 @@ import { chatRateLimit } from '../middleware/rate-limit.js';
 import { parseChatRequest } from '../schemas/chat.schema.js';
 import { createLegacyChatStream } from '../services/openai.service.js';
 import { streamOrchestrator } from '../services/orchestrator-client.js';
-import { getChatHistory, recordChatRequest } from '../services/database.service.js';
+import { buildSessionSummaryText, getChatHistory, getSessionState, recordChatRequest, upsertSessionState } from '../services/database.service.js';
 import { decideOrchestrationPath } from '../services/orchestration-rollout.js';
 import { recordOrchestratorCall, recordProviderError } from '../services/metrics.service.js';
 import { AppError } from '../utils/errors.js';
 import { closeSseWithDone, initSse, writeSseData, writeSseEvent } from '../utils/sse.js';
+import { stringifyChatMessageForStorage } from '../utils/chat-attachments.js';
 
 const streamLegacy = async (messages, res) => {
   const stream = await createLegacyChatStream(messages);
@@ -37,6 +38,10 @@ const streamChatHandler = async (req, res, next) => {
   const persistChat = ({ responseChars = 0, status = 'ok', errorCode = null, assistantMessage: nextAssistantMessage = assistantMessage } = {}) => {
     if (persisted) return;
     persisted = true;
+
+    const lastUserMessage = [...messages].reverse().find((item) => item?.role === 'user') || null;
+    const userMessageText = stringifyChatMessageForStorage(lastUserMessage);
+
     recordChatRequest({
       requestId: req.requestId,
       sessionId,
@@ -44,12 +49,38 @@ const streamChatHandler = async (req, res, next) => {
       mode: env.orchestrationMode,
       orchestrationPath: routingTarget,
       messages,
-      userMessage: [...messages].reverse().find((item) => item?.role === 'user')?.content || '',
+      userMessage: userMessageText,
       assistantMessage: nextAssistantMessage,
       responseChars,
       status,
       errorCode,
     });
+  };
+
+  const refreshSessionSummary = async (assistantText) => {
+    try {
+      const sessionState = await getSessionState({
+        sessionId,
+        userSub: req.auth?.sub,
+      });
+
+      const summary = buildSessionSummaryText({
+        currentObjective: sessionState.currentObjective,
+        userMessage: stringifyChatMessageForStorage([...messages].reverse().find((item) => item?.role === 'user') || null),
+        assistantMessage: assistantText,
+        messageCount: messages.length,
+      });
+
+      await upsertSessionState({
+        sessionId,
+        userSub: req.auth?.sub,
+        sessionSummary: summary,
+        objectiveStep: sessionState.objectiveStep,
+        objectiveProgress: sessionState.objectiveProgress,
+      });
+    } catch (error) {
+      logger.warn({ err: error, request_id: req.requestId }, 'session_summary_refresh_failed');
+    }
   };
 
   try {
@@ -77,6 +108,7 @@ const streamChatHandler = async (req, res, next) => {
         status: 'ok',
         assistantMessage,
       });
+      await refreshSessionSummary(assistantMessage);
       closeSseWithDone(res);
       return;
     }
@@ -112,6 +144,7 @@ const streamChatHandler = async (req, res, next) => {
             status: 'ok',
             assistantMessage,
           });
+          await refreshSessionSummary(assistantMessage);
           closeSseWithDone(res);
           return;
         }
@@ -137,6 +170,7 @@ const streamChatHandler = async (req, res, next) => {
           status: 'ok',
           assistantMessage,
         });
+        await refreshSessionSummary(assistantMessage);
         closeSseWithDone(res);
       }
       return;
@@ -161,6 +195,7 @@ const streamChatHandler = async (req, res, next) => {
           assistantMessage,
           errorCode: orchestratorError?.code || 'ORCHESTRATOR_FAILED',
         });
+        await refreshSessionSummary(assistantMessage);
         closeSseWithDone(res);
         return;
       }
@@ -203,6 +238,64 @@ chatRouter.get('/chat/history', authJwtMiddleware, async (req, res, next) => {
       session_id: history.sessionId,
       count: history.count || 0,
       messages: history.messages,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+chatRouter.get('/session-state', authJwtMiddleware, async (req, res, next) => {
+  try {
+    const sessionId = req.get('x-session-id') || req.query.session_id;
+    const state = await getSessionState({
+      sessionId,
+      userSub: req.auth?.sub,
+    });
+
+    return res.json({
+      session_id: state.sessionId,
+      current_objective: state.currentObjective,
+      session_summary: state.sessionSummary,
+      current_view: state.currentView,
+      active_tab: state.activeTab,
+      objective_step: state.objectiveStep,
+      objective_progress: state.objectiveProgress,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+chatRouter.put('/session-state', authJwtMiddleware, authorizeScope('chat:write'), async (req, res, next) => {
+  try {
+    const sessionId = req.get('x-session-id') || req.body?.session_id || req.query.session_id;
+    const currentObjective = typeof req.body?.current_objective === 'string' ? req.body.current_objective : null;
+    const sessionSummary = typeof req.body?.session_summary === 'string' ? req.body.session_summary : null;
+    const currentView = typeof req.body?.current_view === 'string' ? req.body.current_view : null;
+    const activeTab = typeof req.body?.active_tab === 'string' ? req.body.active_tab : null;
+    const objectiveStep = Number.isFinite(Number(req.body?.objective_step)) ? Number(req.body.objective_step) : 0;
+    const objectiveProgress = Number.isFinite(Number(req.body?.objective_progress)) ? Number(req.body.objective_progress) : 0;
+
+    await upsertSessionState({
+      sessionId,
+      userSub: req.auth?.sub,
+      currentObjective,
+      sessionSummary,
+      currentView,
+      activeTab,
+      objectiveStep,
+      objectiveProgress,
+    });
+
+    return res.json({
+      ok: true,
+      session_id: sessionId || null,
+      current_objective: currentObjective,
+      session_summary: sessionSummary,
+      current_view: currentView,
+      active_tab: activeTab,
+      objective_step: objectiveStep,
+      objective_progress: objectiveProgress,
     });
   } catch (error) {
     return next(error);
