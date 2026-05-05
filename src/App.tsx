@@ -8,19 +8,13 @@ import { motion, AnimatePresence } from 'motion/react';
 import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { useChatStream } from './hooks/useChatStream';
 import { useSessionStateSync } from './hooks/useSessionStateSync';
 import { useBackendSnapshot } from './hooks/useBackendSnapshot';
 import { CHAT_ATTACHMENT_ACCEPT, useChatAttachments, type ChatAttachment } from './hooks/useChatAttachments';
 
 interface Agent {
   id: string; name: string; role: string; icon: any;
-}
-
-interface Message {
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  tone?: 'error';
-  attachments?: ChatAttachment[];
 }
 
 interface SessionLog {
@@ -101,37 +95,6 @@ const readErrorPayload = async (response: Response): Promise<{ code: string; mes
   return { code, message };
 };
 
-const readChatErrorPayload = async (response: Response): Promise<{ code: string; message: string }> => {
-  const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  const rawBody = await response.text();
-  const bodySnippet = shrinkText(rawBody);
-
-  let payload: any = null;
-  if (rawBody && (contentType.includes('application/json') || rawBody.trim().startsWith('{'))) {
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      payload = null;
-    }
-  }
-
-  const nestedDetail = payload?.detail && typeof payload.detail === 'object' ? payload.detail : null;
-  const code =
-    (typeof payload?.error?.code === 'string' && payload.error.code) ||
-    (typeof payload?.code === 'string' && payload.code) ||
-    (typeof nestedDetail?.code === 'string' && nestedDetail.code) ||
-    'CHAT_HTTP_ERROR';
-
-  const message =
-    (typeof payload?.error?.message === 'string' && payload.error.message) ||
-    (typeof payload?.message === 'string' && payload.message) ||
-    (typeof nestedDetail?.message === 'string' && nestedDetail.message) ||
-    bodySnippet ||
-    `Erreur HTTP ${response.status}`;
-
-  return { code, message };
-};
-
 const SESSION_STORAGE_KEY = 'mindmesh.session_id';
 
 const createSessionId = (): string => {
@@ -185,9 +148,6 @@ export default function App() {
   const [message, setMessage] = useState('');
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
   const [isDarkMode, setIsDarkMode] = useState(true);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionLogs, setSessionLogs] = useState<SessionLog[]>([]);
   const [currentView, setCurrentView] = useState<'chat' | 'dashboard'>('chat');
   const [objectiveProgress, setObjectiveProgress] = useState(0);
@@ -221,6 +181,12 @@ export default function App() {
     removeAttachment,
   } = useChatAttachments();
 
+  const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, '');
+  const UPGRADE_URL = (import.meta.env.VITE_UPGRADE_URL || import.meta.env.VITE_BILLING_URL || '').trim();
+  const BILLING_URL = (import.meta.env.VITE_BILLING_URL || '').trim();
+  const METRICS_SECRET = (import.meta.env.VITE_METRICS_SECRET || '').trim();
+  const METRICS_ADMIN_TOKEN = (import.meta.env.VITE_METRICS_ADMIN_TOKEN || '').trim();
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', isDarkMode ? 'dark' : 'light');
   }, [isDarkMode]);
@@ -229,19 +195,6 @@ export default function App() {
     if (!logsContainerRef.current) return;
     logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
   }, [sessionLogs]);
-
-  const latestAssistantMessage =
-    [...messages].reverse().find((m) => m.role === 'assistant')?.content ?? '';
-  const totalMessages = messages.length;
-  const userMessagesCount = messages.filter((m) => m.role === 'user').length;
-  const assistantMessagesCount = messages.filter((m) => m.role === 'assistant').length;
-  const failedMessagesCount = messages.filter((m) => m.role === 'system' && m.tone === 'error').length;
-  const completedSteps = objectiveStep;
-  const UPGRADE_URL = (import.meta.env.VITE_UPGRADE_URL || import.meta.env.VITE_BILLING_URL || '').trim();
-  const BILLING_URL = (import.meta.env.VITE_BILLING_URL || '').trim();
-  const METRICS_SECRET = (import.meta.env.VITE_METRICS_SECRET || '').trim();
-  const METRICS_ADMIN_TOKEN = (import.meta.env.VITE_METRICS_ADMIN_TOKEN || '').trim();
-  const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, '');
 
   const getAuthorizationHeaders = useCallback(async (): Promise<Record<string, string>> => {
     try {
@@ -291,49 +244,52 @@ export default function App() {
     });
   };
 
-  const loadChatHistory = useCallback(async () => {
-    try {
-      const authHeaders = await getAuthorizationHeaders();
-      const response = await fetch(`${API_BASE_URL}/api/chat/history?limit=100`, {
-        headers: {
-          ...authHeaders,
-          'X-Session-Id': sessionId,
-        },
-      });
+  const pushSessionLog = useCallback((logMessage: string, tone: SessionLog['tone'] = 'info') => {
+    const now = Date.now();
 
-      if (!response.ok) return;
+    setSessionLogs((prev) => {
+      const nextLog: SessionLog = {
+        id: String(now) + '-' + String(prev.length),
+        timestamp: new Date(now).toLocaleTimeString('fr-FR', {
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        }),
+        message: logMessage,
+        tone,
+      };
 
-      const payload = await response.json();
-      const loadedMessages = Array.isArray(payload?.messages)
-        ? payload.messages
-            .filter((item: any) => item && typeof item === 'object')
-            .map((item: any) => ({
-              role: item.role === 'assistant' || item.role === 'system' ? item.role : 'user',
-              content: typeof item.content === 'string' ? item.content : '',
-              tone: item.tone === 'error' ? 'error' : undefined,
-              attachments: Array.isArray(item.attachments)
-                ? item.attachments
-                    .filter((attachment: any) => attachment && typeof attachment === 'object')
-                    .map((attachment: any) => ({
-                      id: typeof attachment.id === 'string' ? attachment.id : '',
-                      name: typeof attachment.name === 'string' ? attachment.name : 'fichier',
-                      mimeType: typeof attachment.mimeType === 'string' ? attachment.mimeType : 'application/octet-stream',
-                      kind: attachment.kind === 'image' ? 'image' : 'document',
-                      size: Number.isFinite(Number(attachment.size)) ? Number(attachment.size) : 0,
-                      dataUrl: typeof attachment.dataUrl === 'string' ? attachment.dataUrl : undefined,
-                      textPreview: typeof attachment.textPreview === 'string' ? attachment.textPreview : undefined,
-                    }))
-                    .filter((attachment: ChatAttachment) => attachment.name.trim().length > 0)
-                : undefined,
-            }))
-            .filter((item: Message) => item.content.trim().length > 0 || (item.attachments?.length || 0) > 0)
-        : [];
+      return [...prev, nextLog].slice(-80);
+    });
+  }, []);
 
-      setMessages(loadedMessages);
-    } catch (error) {
-      console.error('Historique chat indisponible:', error);
-    }
-  }, [API_BASE_URL, getAuthorizationHeaders, sessionId]);
+  const {
+    messages,
+    isLoading,
+    latencyMs,
+    sendMessage,
+    clearMessages,
+  } = useChatStream({
+    apiBaseUrl: API_BASE_URL,
+    sessionId,
+    getAuthorizationHeaders,
+    onLog: pushSessionLog,
+    onAgentStatus: (agent, status) => {
+      if (!agent) return;
+      setAgentStatuses((prev) => ({
+        ...prev,
+        [agent]: status,
+      }));
+    },
+  });
+
+  const latestAssistantMessage =
+    [...messages].reverse().find((m) => m.role === 'assistant')?.content ?? '';
+  const totalMessages = messages.length;
+  const userMessagesCount = messages.filter((m) => m.role === 'user').length;
+  const assistantMessagesCount = messages.filter((m) => m.role === 'assistant').length;
+  const failedMessagesCount = messages.filter((m) => m.role === 'system' && m.tone === 'error').length;
+  const completedSteps = objectiveStep;
 
   useEffect(() => {
     if (!sessionStateHydratedRef.current) return;
@@ -391,43 +347,6 @@ export default function App() {
     { id: 'stratege_seo', name: 'Stratège SEO', role: 'Optimisation visibilité', icon: Zap },
   ];
 
-  const formatLogTime = (timestamp: number) =>
-    new Date(timestamp).toLocaleTimeString('fr-FR', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    });
-
-  const pushSessionLog = (logMessage: string, tone: SessionLog['tone'] = 'info') => {
-    const now = Date.now();
-
-    setSessionLogs((prev) => {
-      const nextLog: SessionLog = {
-        id: String(now) + '-' + String(prev.length),
-        timestamp: formatLogTime(now),
-        message: logMessage,
-        tone,
-      };
-
-      return [...prev, nextLog].slice(-80);
-    });
-  };
-
-  const pushChatErrorMessage = (errorText: string) => {
-    const fallback = `Connexion API impossible. Vérifie que le backend tourne sur ${API_BASE_URL}.`;
-    const compact = shrinkText(errorText || '', 260);
-    const messageText = compact || fallback;
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        role: 'system',
-        content: messageText,
-        tone: 'error',
-      },
-    ]);
-  };
-
   const getLogToneClass = (tone: SessionLog['tone']) => {
     if (tone === 'success') return 'text-green-500';
     if (tone === 'warn') return 'text-amber-500';
@@ -456,9 +375,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void loadChatHistory();
     void loadSessionState();
-  }, [loadChatHistory, loadSessionState]);
+  }, [loadSessionState]);
 
   const formatSnapshotTime = (timestamp: number | null) => {
     if (!timestamp) return '--';
@@ -635,10 +553,9 @@ export default function App() {
   };
 
   const resetSession = () => {
-    setMessages([]);
+    clearMessages();
     setMessage('');
     setSessionLogs([]);
-    setLatencyMs(null);
     resetAgentStatuses();
     setCurrentView('chat');
     setActiveTab('preview');
@@ -668,8 +585,8 @@ export default function App() {
     });
   };
 
-  const sendPrompt = async (promptInput: string) => {
-    const trimmedMessage = promptInput.trim();
+  const handleSend = async () => {
+    const trimmedMessage = message.trim();
     const selectedAttachments = attachments.map((attachment) => ({ ...attachment }));
     const hasAttachments = selectedAttachments.length > 0;
     if ((!trimmedMessage && !hasAttachments) || isLoading || isPreparingAttachments) return;
@@ -686,33 +603,15 @@ export default function App() {
       }
     }
 
-    const requestStartedAt = Date.now();
-    let latencyCaptured = false;
-    let didLogCompletion = false;
-
-    const captureLatency = () => {
-      if (latencyCaptured) return;
-      latencyCaptured = true;
-      setLatencyMs(Date.now() - requestStartedAt);
-    };
-
-    const userMessage: Message = {
-      role: 'user',
-      content: trimmedMessage,
-      attachments: hasAttachments ? selectedAttachments : undefined,
-    };
-    setSecurityScore(evaluatePromptSecurity(trimmedMessage));
-    const nextMessages = [...messages, userMessage];
     const nextObjectiveStep = Math.min(objectiveStep + 1, 5);
     const nextObjectiveProgress = Math.min(objectiveProgress + 20, 100);
 
-    setMessages(nextMessages);
     clearAttachments();
     resetAgentStatuses();
     setMessage('');
-    setIsLoading(true);
     setObjectiveStep(nextObjectiveStep);
     setObjectiveProgress(nextObjectiveProgress);
+
     void persistSessionState({
       currentObjective: nextCurrentObjective,
       sessionSummary,
@@ -720,191 +619,7 @@ export default function App() {
       objectiveProgress: nextObjectiveProgress,
     });
 
-    pushSessionLog('Awaiting sync...');
-    pushSessionLog('Routing to orchestrator...');
-
-    try {
-      const authHeaders = await getAuthorizationHeaders();
-      const response = await fetch(`${API_BASE_URL}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Session-Id': sessionId,
-          ...authHeaders,
-        },
-        body: JSON.stringify({ messages: nextMessages }),
-      });
-
-      if (!response.ok) {
-        const { code, message: apiMessage } = await readChatErrorPayload(response);
-        throw new Error(`${code}: ${apiMessage}`);
-      }
-
-      if (!response.body) {
-        throw new Error('CHAT_STREAM_UNAVAILABLE: Réponse sans flux de données.');
-      }
-
-      const contentType = (response.headers.get('content-type') || '').toLowerCase();
-
-      if (!contentType.includes('text/event-stream')) {
-        const rawBody = await response.text();
-        let parsed: any = null;
-        try {
-          parsed = rawBody ? JSON.parse(rawBody) : null;
-        } catch {
-          parsed = null;
-        }
-
-        const directResponse =
-          (typeof parsed?.content === 'string' && parsed.content.trim()) ||
-          (typeof parsed?.message === 'string' && parsed.message.trim()) ||
-          rawBody.trim();
-
-        if (!directResponse) {
-          throw new Error('CHAT_EMPTY_RESPONSE: Le backend a répondu sans contenu exploitable.');
-        }
-
-        captureLatency();
-        pushSessionLog('Generation complete.', 'success');
-        setMessages((prev) => [...prev, { role: 'assistant', content: directResponse }]);
-        return;
-      }
-
-      pushSessionLog('Core engine ready.');
-
-      const reader: ReadableStreamDefaultReader<Uint8Array> = response.body.getReader();
-      const decoder = new TextDecoder();
-      let assistantText = '';
-      let hasAssistantMessage = false;
-      let sseBuffer = '';
-      let streamEnded = false;
-
-      while (!streamEnded) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value) continue;
-
-        sseBuffer += decoder.decode(value, { stream: true });
-
-        let eventBoundary = sseBuffer.indexOf('\n\n');
-        while (eventBoundary !== -1) {
-          const rawEvent = sseBuffer.slice(0, eventBoundary);
-          sseBuffer = sseBuffer.slice(eventBoundary + 2);
-
-          const lines = rawEvent.split(/\r?\n/);
-          let eventType = 'message';
-          const dataLines: string[] = [];
-
-          for (const line of lines) {
-            if (line.startsWith('event:')) {
-              eventType = line.slice(6).trim();
-              continue;
-            }
-            if (line.startsWith('data:')) {
-              dataLines.push(line.slice(5).replace(/^\s/, ''));
-            }
-          }
-
-          if (dataLines.length > 0) {
-            const payload = dataLines.join('\n');
-
-            if (eventType === 'done' || payload === '[DONE]') {
-              captureLatency();
-              didLogCompletion = true;
-              pushSessionLog('Generation complete.', 'success');
-              streamEnded = true;
-              break;
-            }
-
-            if (eventType === 'agent_status') {
-              const data = payload;
-              console.log('🟢 [SSE Télémétrie] Statut Agent reçu:', data);
-              try {
-                const parsedStatus = JSON.parse(data);
-                const mappedAgent = String(parsedStatus?.agent || '').trim().toLowerCase();
-                const nextStatus = parsedStatus?.status === 'working' ? 'working' : 'idle';
-
-                if (mappedAgent && Object.prototype.hasOwnProperty.call(agentStatuses, mappedAgent)) {
-                  setAgentStatuses((prev) => ({
-                    ...prev,
-                    [mappedAgent]: nextStatus,
-                  }));
-                }
-              } catch (statusError) {
-                console.warn('agent_status SSE parse failed:', statusError);
-              }
-              continue;
-            }
-
-            if (eventType === 'error') {
-              let streamErrorMessage = payload || 'Erreur de streaming';
-              try {
-                const parsedError = JSON.parse(payload);
-                streamErrorMessage =
-                  (typeof parsedError?.error?.message === 'string' && parsedError.error.message) ||
-                  (typeof parsedError?.message === 'string' && parsedError.message) ||
-                  streamErrorMessage;
-              } catch {
-                // noop
-              }
-              throw new Error(`CHAT_STREAM_ERROR: ${streamErrorMessage}`);
-            }
-
-            assistantText += payload;
-            if (!hasAssistantMessage) {
-              captureLatency();
-              pushSessionLog('Generation started...');
-              setMessages((prev) => [...prev, { role: 'assistant', content: assistantText }]);
-              hasAssistantMessage = true;
-              setIsLoading(false);
-            } else {
-              setMessages((prev) => {
-                const updated = [...prev];
-                const last = updated[updated.length - 1];
-                if (!last || last.role !== 'assistant') {
-                  updated.push({ role: 'assistant', content: assistantText });
-                } else {
-                  updated[updated.length - 1] = { ...last, content: assistantText };
-                }
-                return updated;
-              });
-            }
-          }
-
-          eventBoundary = sseBuffer.indexOf('\n\n');
-        }
-      }
-
-      const tail = decoder.decode();
-      if (tail) {
-        assistantText += tail;
-        if (!hasAssistantMessage && assistantText.trim()) {
-          captureLatency();
-          setMessages((prev) => [...prev, { role: 'assistant', content: assistantText }]);
-          hasAssistantMessage = true;
-        }
-      }
-
-      if (!didLogCompletion) {
-        captureLatency();
-        pushSessionLog('Generation complete.', 'success');
-      }
-    } catch (error) {
-      captureLatency();
-      console.error('Erreur Chat:', error);
-      pushSessionLog('Generation failed.', 'warn');
-
-      const rawErrorMessage = error instanceof Error ? error.message : 'Connexion API impossible.';
-      const cleanedErrorMessage = rawErrorMessage.replace(/^[A-Z0-9_]+:\s*/i, '').trim();
-      pushChatErrorMessage(cleanedErrorMessage);
-    } finally {
-      setIsLoading(false);
-      setIsExecutingWorkspace(false);
-    }
-  };
-
-  const handleSend = async () => {
-    await sendPrompt(message);
+    await sendMessage(trimmedMessage, { attachments: selectedAttachments });
   };
 
   const handleExecuteWorkspace = async () => {
@@ -924,7 +639,11 @@ export default function App() {
     setIsExecutingWorkspace(true);
     pushSessionLog('Execution workspace declenchee...', 'info');
     showWorkspaceNotice('info', 'Execution en cours via l\'orchestrateur.');
-    await sendPrompt(executionPrompt);
+    try {
+      await sendMessage(executionPrompt);
+    } finally {
+      setIsExecutingWorkspace(false);
+    }
   };
 
   // GESTION DU MICRO
