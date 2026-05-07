@@ -13,7 +13,7 @@
     "preview": "vite preview",
     "clean": "rimraf dist",
     "lint": "tsc --noEmit",
-    "test:api": "node --test backend/public-api/test/auth-and-routes.test.js backend/public-api/test/db-retention.service.test.js",
+    "test:api": "node --test --test-concurrency=1 backend/public-api/test/auth-and-routes.test.js backend/public-api/test/db-retention.service.test.js backend/public-api/test/orchestrator-fallback.integration.test.js",
     "test:ops": "node --test scripts/ops/preflight.test.js",
     "test:orchestrator": "python -m unittest discover -s backend/orchestrator/tests -p \"test_*.py\" -v",
     "ops:preflight": "node scripts/ops/preflight.mjs --env-file .env --require-prod-flags",
