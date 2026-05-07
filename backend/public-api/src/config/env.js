@@ -87,8 +87,10 @@ export const env = {
   openaiBaseUrl: process.env.OPENAI_BASE_URL || 'https://build.lewisnote.com/v1',
   openaiModel: (process.env.OPENAI_MODEL || 'gpt-5.4-mini').trim() || 'gpt-5.4-mini',
 
+  lewisnoteApiKey: process.env.LEWISNOTE_API_KEY || '',
+  afriAsrApiKey: process.env.AFRI_ASR_API_KEY || '',
   asrModel: process.env.ASR_MODEL || 'afri-asr',
-  asrApiKey: process.env.ASR_API_KEY || process.env.OPENAI_API_KEY || '',
+  asrApiKey: process.env.ASR_API_KEY || process.env.LEWISNOTE_API_KEY || process.env.AFRI_ASR_API_KEY || '',
   asrEndpoint: process.env.ASR_ENDPOINT || 'https://build.lewisnote.com/v1/audio/afri-asr/transcribe',
   asrTimeoutMs: toInt(process.env.ASR_TIMEOUT_MS, 45_000),
   transcribeMaxBytes: toInt(process.env.TRANSCRIBE_MAX_BYTES, 10 * 1024 * 1024),

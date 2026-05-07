@@ -20,9 +20,11 @@ const extractProviderMessage = (parsed, rawText) => {
 };
 
 export const transcribeFileViaProvider = async ({ filePath, originalName = 'voice.webm', mimeType = 'audio/webm' }) => {
-  const apiKey = env.asrApiKey || env.openaiApiKey;
+  const apiKey = env.lewisnoteApiKey || env.afriAsrApiKey || env.asrApiKey;
   if (!apiKey) {
-    throw new AppError(500, 'ASR_MISSING_API_KEY', 'ASR_API_KEY (ou OPENAI_API_KEY) manquante.', { expose: true });
+    throw new AppError(500, 'ASR_MISSING_API_KEY', 'LEWISNOTE_API_KEY (ou AFRI_ASR_API_KEY / ASR_API_KEY) manquante.', {
+      expose: true,
+    });
   }
 
   const buffer = await readFile(filePath);

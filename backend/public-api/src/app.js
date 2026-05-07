@@ -8,6 +8,7 @@ import { errorHandler, notFoundHandler } from './middleware/error-handler.js';
 import { requestIdMiddleware } from './middleware/request-id.js';
 import { chatRouter } from './routes/chat.routes.js';
 import { healthRouter } from './routes/health.routes.js';
+import { voiceRouter } from './routes/voice.routes.js';
 import { transcribeRouter } from './routes/transcribe.routes.js';
 import { metricsMiddleware } from './services/metrics.service.js';
 
@@ -52,6 +53,7 @@ export const createApp = () => {
   app.use(metricsMiddleware);
 
   app.use('/api', chatRouter);
+  app.use('/api/voice', voiceRouter);
   app.use('/api', transcribeRouter);
   app.use('/', healthRouter);
 

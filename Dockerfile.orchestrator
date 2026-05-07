@@ -1,0 +1,15 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY backend/orchestrator/requirements.txt /tmp/requirements.txt
+RUN pip install --default-timeout=1000 --no-cache-dir -r /tmp/requirements.txt
+
+COPY backend ./backend
+
+EXPOSE 8081
+
+CMD ["python", "-m", "uvicorn", "backend.orchestrator.app.main:app", "--host", "0.0.0.0", "--port", "8081"]

@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { env } from '../config/env.js';
+import { authJwtMiddleware } from '../middleware/auth-jwt.js';
 import { checkDatabaseReadiness, getDatabasePublicStatus } from '../services/database.service.js';
 import { metricsRegistry } from '../services/metrics.service.js';
 import { checkOrchestratorHealth } from '../services/orchestrator-health.service.js';
@@ -41,6 +42,18 @@ const metricsAuthMiddleware = (req, res, next) => {
       request_id: req.requestId || 'unknown',
     },
   });
+};
+
+const buildProxyMetricsHeaders = () => {
+  const headers = {};
+
+  if (env.metricsAdminToken) {
+    headers.Authorization = 'Bearer ' + env.metricsAdminToken;
+  } else if (env.metricsHeaderSecret) {
+    headers['x-metrics-secret'] = env.metricsHeaderSecret;
+  }
+
+  return headers;
 };
 
 healthRouter.get('/healthz', (_req, res) => {
@@ -110,5 +123,34 @@ healthRouter.get('/metrics', metricsAuthMiddleware, async (_req, res, next) => {
     res.send(await metricsRegistry.metrics());
   } catch (error) {
     next(error);
+  }
+});
+
+healthRouter.get('/api/internal-metrics', authJwtMiddleware, async (req, res, next) => {
+  try {
+    const proxyHeaders = buildProxyMetricsHeaders();
+
+    if (Object.keys(proxyHeaders).length === 0) {
+      res.setHeader('Content-Type', metricsRegistry.contentType);
+      return res.send(await metricsRegistry.metrics());
+    }
+
+    const proxyUrl = `http://127.0.0.1:${env.port}/metrics`;
+    const proxyResponse = await fetch(proxyUrl, { headers: proxyHeaders });
+
+    if (!proxyResponse.ok) {
+      return res.status(proxyResponse.status).json({
+        error: {
+          code: 'METRICS_PROXY_FAILED',
+          message: 'Impossible de recuperer les metriques internes.',
+          request_id: req.requestId || 'unknown',
+        },
+      });
+    }
+
+    res.setHeader('Content-Type', metricsRegistry.contentType);
+    return res.send(await proxyResponse.text());
+  } catch (error) {
+    return next(error);
   }
 });

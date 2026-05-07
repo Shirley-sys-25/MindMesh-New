@@ -1,190 +1,86 @@
-﻿import { useState, useEffect, useRef, useCallback } from 'react';
+﻿import { useState, useEffect, useRef, useCallback, type ChangeEvent } from 'react';
 import { 
-  Plus, Brain, Send, Mic, Share2, Download, Play, Code, Eye,
-  Terminal, Activity, LayoutDashboard,
-  ShieldCheck, Cpu, Sun, Moon, Paperclip, X
+  Plus, Target, Trophy, Brain, Send, Mic, Paperclip, X, Share2, Download, Play, Code, Eye,
+  Terminal, Activity, Globe, Search, Zap, LayoutDashboard,
+  ShieldCheck, Cpu, Sun, Moon, AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { useChatStream } from './hooks/useChatStream';
-import { ChatComposer } from './components/ChatComposer';
-import { ChatMessages } from './components/ChatMessages';
-import { SessionSidebar } from './components/SessionSidebar';
-import { useSessionStateSync } from './hooks/useSessionStateSync';
+import { useVoiceTranscription } from './hooks/useVoiceTranscription.ts';
+import DashboardView from './components/DashboardView';
 import { useBackendSnapshot } from './hooks/useBackendSnapshot';
-import { CHAT_ATTACHMENT_ACCEPT, useChatAttachments } from './hooks/useChatAttachments';
-
-interface SessionLog {
-  id: string;
-  timestamp: string;
-  message: string;
-  tone: 'info' | 'success' | 'warn';
-}
-
-interface WorkspaceNotice {
-  tone: 'info' | 'success' | 'warn';
-  text: string;
-}
-
-const preferredRecorderMimeTypes = [
-  'audio/webm;codecs=opus',
-  'audio/webm',
-  'audio/mp4',
-  'audio/ogg;codecs=opus',
-  'audio/ogg',
-  'audio/wav',
-];
-
-const pickRecorderMimeType = (): string => {
-  if (typeof MediaRecorder === 'undefined') return '';
-  if (typeof MediaRecorder.isTypeSupported !== 'function') return '';
-  return preferredRecorderMimeTypes.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) || '';
-};
-
-const getAudioExtensionFromMime = (mimeType: string): string => {
-  const normalized = (mimeType || '').toLowerCase();
-  if (normalized.includes('mp4')) return 'm4a';
-  if (normalized.includes('ogg')) return 'ogg';
-  if (normalized.includes('wav')) return 'wav';
-  if (normalized.includes('mpeg') || normalized.includes('mp3')) return 'mp3';
-  return 'webm';
-};
-
-const shrinkText = (value: string, max = 180): string => {
-  const compact = value.replace(/\s+/g, ' ').trim();
-  if (!compact) return '';
-  return compact.length > max ? compact.slice(0, max) + '...' : compact;
-};
-
-const readErrorPayload = async (response: Response): Promise<{ code: string; message: string }> => {
-  const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  const rawBody = await response.text();
-  const bodySnippet = shrinkText(rawBody);
-
-  let payload: any = null;
-  if (rawBody && (contentType.includes('application/json') || rawBody.trim().startsWith('{'))) {
-    try {
-      payload = JSON.parse(rawBody);
-    } catch {
-      payload = null;
-    }
-  }
-
-  const nestedDetail = payload?.detail && typeof payload.detail === 'object' ? payload.detail : null;
-  const legacyErrorMessage = typeof payload?.error === 'string' ? payload.error.trim() : '';
-
-  const code =
-    (typeof payload?.error?.code === 'string' && payload.error.code) ||
-    (typeof payload?.code === 'string' && payload.code) ||
-    (typeof nestedDetail?.code === 'string' && nestedDetail.code) ||
-    (legacyErrorMessage ? 'TRANSCRIBE_BACKEND_ERROR' : '') ||
-    (contentType.includes('text/html') ? 'TRANSCRIBE_API_MISROUTE' : 'TRANSCRIBE_HTTP_ERROR');
-
-  const message =
-    (typeof payload?.error?.message === 'string' && payload.error.message) ||
-    (typeof payload?.message === 'string' && payload.message) ||
-    (typeof nestedDetail?.message === 'string' && nestedDetail.message) ||
-    legacyErrorMessage ||
-    (contentType.includes('text/html')
-      ? 'La requete audio n\'a pas atteint l\'API /api/transcribe (verifie VITE_API_BASE_URL et le serveur API).'
-      : bodySnippet || `Erreur HTTP ${response.status}`);
-
-  return { code, message };
-};
-
-const SESSION_STORAGE_KEY = 'mindmesh.session_id';
-
-const createSessionId = (): string => {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-
-  return 'session-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
-};
-
-const readOrCreateSessionId = (): string => {
-  if (typeof window === 'undefined') return createSessionId();
-
-  const existing = window.localStorage.getItem(SESSION_STORAGE_KEY);
-  if (existing) return existing;
-
-  const generated = createSessionId();
-  window.localStorage.setItem(SESSION_STORAGE_KEY, generated);
-  return generated;
-};
-
-const BASIC_GREETING_WORDS = new Set(['bonjour', 'salut', 'hello', 'coucou', 'hi', 'hey']);
-
-const normalizeForObjectiveCapture = (value: string): string =>
-  value
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s'-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-const captureObjectiveFromMessage = (value: string): string | null => {
-  const compact = normalizeForObjectiveCapture(value);
-  if (!compact) return null;
-
-  const words = compact.split(' ').filter(Boolean);
-  if (words.length < 4 || compact.length < 20) return null;
-
-  const greetingOnly = words.every((word) => BASIC_GREETING_WORDS.has(word));
-  if (greetingOnly) return null;
-
-  return value.replace(/\s+/g, ' ').trim();
-};
+import { useChatHistory } from './hooks/useChatHistory';
+import { useChatPromptSender } from './hooks/useChatPromptSender';
+import { useWorkspaceNotice } from './hooks/useWorkspaceNotice';
+import {
+  type Agent,
+  type AttachmentPreview,
+  type SessionLog,
+} from './lib/appTypes';
+import {
+  CHAT_ATTACHMENT_ACCEPT,
+  createSessionId,
+  SESSION_STORAGE_KEY,
+  evaluatePromptSecurity,
+  formatAttachmentSize,
+  formatCounter,
+  formatLogTime,
+  formatSnapshotTime,
+  readOrCreateSessionId,
+  shrinkText,
+} from './lib/appUtils';
 
 export default function App() {
   const { signOut, openUserProfile } = useClerk();
   const { getToken } = useAuth();
   const { user } = useUser();
+  const getAuthorizationHeaders = useCallback(async (): Promise<Record<string, string>> => {
+    try {
+      const token = await getToken();
+      return token ? { Authorization: 'Bearer ' + token } : {};
+    } catch {
+      return {};
+    }
+  }, [getToken]);
   const [showMenu, setShowMenu] = useState(false);
   const [message, setMessage] = useState('');
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
   const [isDarkMode, setIsDarkMode] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionLogs, setSessionLogs] = useState<SessionLog[]>([]);
   const [currentView, setCurrentView] = useState<'chat' | 'dashboard'>('chat');
   const [objectiveProgress, setObjectiveProgress] = useState(0);
   const [objectiveStep, setObjectiveStep] = useState(0);
   const [currentObjective, setCurrentObjective] = useState<string | null>(null);
-  const [sessionSummary, setSessionSummary] = useState<string | null>(null);
   const [securityScore, setSecurityScore] = useState(99.8);
   const [isExecutingWorkspace, setIsExecutingWorkspace] = useState(false);
-  const [workspaceNotice, setWorkspaceNotice] = useState<WorkspaceNotice | null>(null);
+  const { workspaceNotice, showWorkspaceNotice } = useWorkspaceNotice();
   const [agentStatuses, setAgentStatuses] = useState<Record<string, 'idle' | 'working'>>({
     africonnect: 'idle',
     analyste_marche: 'idle',
     stratege_seo: 'idle',
   });
   const [sessionId, setSessionId] = useState(() => readOrCreateSessionId());
-
-  // ÉTATS ET RÉFÉRENCES POUR LE MICRO
-  const [isRecording, setIsRecording] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<Blob[]>([]);
-  const recorderMimeTypeRef = useRef<string>('audio/webm');
+  const [attachmentPreviews, setAttachmentPreviews] = useState<AttachmentPreview[]>([]);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const messageInputRef = useRef<HTMLInputElement | null>(null);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
-  const workspaceNoticeTimeoutRef = useRef<number | null>(null);
-
-  const {
-    attachments,
-    attachmentInputRef,
-    clearAttachments,
-    handleAttachmentSelection,
-    isPreparingAttachments,
-    removeAttachment,
-  } = useChatAttachments();
-
+  const chatHistory = useChatHistory({
+    apiBaseUrl: (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, ''),
+    sessionId,
+    getAuthorizationHeaders,
+  });
+  const { messages, setMessages, loadChatHistory } = chatHistory;
   const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, '');
   const UPGRADE_URL = (import.meta.env.VITE_UPGRADE_URL || import.meta.env.VITE_BILLING_URL || '').trim();
   const BILLING_URL = (import.meta.env.VITE_BILLING_URL || '').trim();
-  const METRICS_SECRET = (import.meta.env.VITE_METRICS_SECRET || '').trim();
-  const METRICS_ADMIN_TOKEN = (import.meta.env.VITE_METRICS_ADMIN_TOKEN || '').trim();
+  const { backendSnapshot, metricsSnapshot, isRefreshingSnapshot, refreshBackendSnapshot } = useBackendSnapshot({
+    apiBaseUrl: API_BASE_URL,
+    getMetricsHeaders: getAuthorizationHeaders,
+  });
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', isDarkMode ? 'dark' : 'light');
@@ -195,93 +91,6 @@ export default function App() {
     logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
   }, [sessionLogs]);
 
-  const getAuthorizationHeaders = useCallback(async (): Promise<Record<string, string>> => {
-    try {
-      const token = await getToken();
-      return token ? { Authorization: 'Bearer ' + token } : {};
-    } catch {
-      return {};
-    }
-  }, [getToken]);
-
-  const getMetricsHeaders = useCallback(async () => {
-    const headers: Record<string, string> = {};
-    if (METRICS_ADMIN_TOKEN) {
-      headers.Authorization = 'Bearer ' + METRICS_ADMIN_TOKEN;
-    }
-    return headers;
-  }, [METRICS_ADMIN_TOKEN]);
-
-  const { loadSessionState, persistSessionState, sessionStateHydratedRef } = useSessionStateSync({
-    apiBaseUrl: API_BASE_URL,
-    sessionId,
-    currentView,
-    activeTab,
-    currentObjective,
-    sessionSummary,
-    objectiveStep,
-    objectiveProgress,
-    getAuthorizationHeaders,
-    setCurrentObjective,
-    setSessionSummary,
-    setCurrentView,
-    setActiveTab,
-    setObjectiveStep,
-    setObjectiveProgress,
-  });
-
-  const { backendSnapshot, isRefreshingSnapshot, metricsSnapshot, refreshBackendSnapshot } = useBackendSnapshot({
-    apiBaseUrl: API_BASE_URL,
-    getMetricsHeaders,
-  });
-
-  const resetAgentStatuses = () => {
-    setAgentStatuses({
-      africonnect: 'idle',
-      analyste_marche: 'idle',
-      stratege_seo: 'idle',
-    });
-  };
-
-  const pushSessionLog = useCallback((logMessage: string, tone: SessionLog['tone'] = 'info') => {
-    const now = Date.now();
-
-    setSessionLogs((prev) => {
-      const nextLog: SessionLog = {
-        id: String(now) + '-' + String(prev.length),
-        timestamp: new Date(now).toLocaleTimeString('fr-FR', {
-          hour: '2-digit',
-          minute: '2-digit',
-          hour12: false,
-        }),
-        message: logMessage,
-        tone,
-      };
-
-      return [...prev, nextLog].slice(-80);
-    });
-  }, []);
-
-  const {
-    messages,
-    isLoading,
-    latencyMs,
-    sendMessage,
-    clearMessages,
-  } = useChatStream({
-    apiBaseUrl: API_BASE_URL,
-    sessionId,
-    getAuthorizationHeaders,
-    onLog: pushSessionLog,
-    onAgentStatus: (agent, status) => {
-      if (!agent) return;
-      setAgentStatuses((prev) => ({
-        ...prev,
-        [agent]: status,
-      }));
-    },
-  });
-
   const latestAssistantMessage =
     [...messages].reverse().find((m) => m.role === 'assistant')?.content ?? '';
   const totalMessages = messages.length;
@@ -289,48 +98,12 @@ export default function App() {
   const assistantMessagesCount = messages.filter((m) => m.role === 'assistant').length;
   const failedMessagesCount = messages.filter((m) => m.role === 'system' && m.tone === 'error').length;
   const completedSteps = objectiveStep;
-
-  useEffect(() => {
-    if (!sessionStateHydratedRef.current) return;
-
-    void persistSessionState({
-      currentObjective,
-      sessionSummary,
-      objectiveStep,
-      objectiveProgress,
+  const resetAgentStatuses = () => {
+    setAgentStatuses({
+      africonnect: 'idle',
+      analyste_marche: 'idle',
+      stratege_seo: 'idle',
     });
-  }, [activeTab, currentObjective, currentView, objectiveProgress, objectiveStep, persistSessionState, sessionSummary]);
-
-  const evaluatePromptSecurity = (prompt: string): number => {
-    if (!prompt.trim()) return 99.8;
-
-    const normalizedPrompt = prompt
-      .toLocaleLowerCase('fr-FR')
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '');
-
-    let score = 99.8;
-    const penalties = [
-      { pattern: /ignore (les )?instructions?/g, value: 35 },
-      { pattern: /ignore (all|any|previous) instructions?/g, value: 35 },
-      { pattern: /system prompt|developer prompt/g, value: 25 },
-      { pattern: /jailbreak|bypass|contourne|desactive la securite/g, value: 25 },
-      { pattern: /rm -rf|powershell|cmd\.exe|curl\s+http|wget\s+http/g, value: 15 },
-      { pattern: /<script|<\/script>|javascript:/g, value: 20 },
-    ];
-
-    for (const rule of penalties) {
-      if (rule.pattern.test(normalizedPrompt)) {
-        score -= rule.value;
-      }
-    }
-
-    const suspiciousChars = (normalizedPrompt.match(/[{}<>`$]/g) || []).length;
-    if (suspiciousChars > 3) {
-      score -= Math.min(20, suspiciousChars * 1.5);
-    }
-
-    return Math.max(0, Math.min(100, Number(score.toFixed(1))));
   };
 
   const securityScoreTextClass =
@@ -340,46 +113,86 @@ export default function App() {
         ? (isDarkMode ? 'text-amber-300' : 'text-amber-600')
         : (isDarkMode ? 'text-red-300' : 'text-red-600');
   
+  const agents: Agent[] = [
+    { id: 'africonnect', name: 'AfriConnect', role: 'Traduction & Contexte Local', icon: Globe },
+    { id: 'analyste_marche', name: 'Analyste Marché', role: 'Analyse des tendances...', icon: Search },
+    { id: 'stratege_seo', name: 'Stratège SEO', role: 'Optimisation visibilité', icon: Zap },
+  ];
+
+  const pushSessionLog = (logMessage: string, tone: SessionLog['tone'] = 'info') => {
+    const now = Date.now();
+
+    setSessionLogs((prev) => {
+      const nextLog: SessionLog = {
+        id: String(now) + '-' + String(prev.length),
+        timestamp: formatLogTime(now),
+        message: logMessage,
+        tone,
+      };
+
+    return [...prev, nextLog].slice(-80);
+    });
+  };
+
+  const { isRecording, toggleRecording } = useVoiceTranscription({
+    message,
+    setMessage,
+    pushSessionLog,
+    getAuthorizationHeaders,
+    apiBaseUrl: API_BASE_URL,
+  });
+
   const getLogToneClass = (tone: SessionLog['tone']) => {
     if (tone === 'success') return 'text-green-500';
     if (tone === 'warn') return 'text-amber-500';
     return 'text-purple-500';
   };
 
-  const showWorkspaceNotice = useCallback((tone: WorkspaceNotice['tone'], text: string) => {
-    setWorkspaceNotice({ tone, text });
+  const onAttachmentSelection = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.currentTarget.files || []);
+    if (files.length === 0) return;
 
-    if (workspaceNoticeTimeoutRef.current !== null) {
-      window.clearTimeout(workspaceNoticeTimeoutRef.current);
-    }
+    const nextPreviews = files.slice(0, 8).map((file, index) => ({
+      id: `${file.name}-${file.size}-${file.lastModified}-${index}`,
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+      size: file.size,
+      preview: file.type.startsWith('text/') ? 'Aperçu texte disponible à l’envoi' : 'Aperçu métadonnées uniquement',
+    }));
 
-    workspaceNoticeTimeoutRef.current = window.setTimeout(() => {
-      setWorkspaceNotice(null);
-      workspaceNoticeTimeoutRef.current = null;
-    }, 5000);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (workspaceNoticeTimeoutRef.current !== null) {
-        window.clearTimeout(workspaceNoticeTimeoutRef.current);
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    void loadSessionState();
-  }, [loadSessionState]);
-
-  const formatSnapshotTime = (timestamp: number | null) => {
-    if (!timestamp) return '--';
-    return new Date(timestamp).toLocaleTimeString('fr-FR', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-    });
+    setAttachmentPreviews(nextPreviews);
+    event.currentTarget.value = '';
+    window.setTimeout(() => messageInputRef.current?.focus(), 0);
   };
+
+  const removeAttachment = (attachmentId: string) => {
+    setAttachmentPreviews((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
+    window.setTimeout(() => messageInputRef.current?.focus(), 0);
+  };
+
+  const { sendPrompt } = useChatPromptSender({
+    apiBaseUrl: API_BASE_URL,
+    sessionId,
+    isLoading,
+    messages,
+    setMessages,
+    currentObjective,
+    setCurrentObjective,
+    setMessage,
+    setIsLoading,
+    setLatencyMs,
+    setSecurityScore,
+    setObjectiveStep,
+    setObjectiveProgress,
+    setIsExecutingWorkspace,
+    setAgentStatuses,
+    pushSessionLog,
+    getAuthorizationHeaders,
+  });
+
+  useEffect(() => {
+    void loadChatHistory();
+  }, [loadChatHistory]);
 
   const workspaceRuntimeState =
     backendSnapshot.ready === 'ready'
@@ -480,11 +293,6 @@ export default function App() {
     showWorkspaceNotice('info', 'Espace facturation ouvert via le profil utilisateur.');
   };
 
-  const formatCounter = (value: number | null) => {
-    if (value === null || !Number.isFinite(value)) return '--';
-    return Math.round(value).toLocaleString('fr-FR');
-  };
-
   const handleDownloadWorkspace = () => {
     const exportText = latestAssistantMessage.trim();
     if (!exportText) {
@@ -546,16 +354,15 @@ export default function App() {
   };
 
   const resetSession = () => {
-    clearMessages();
+    setMessages([]);
     setMessage('');
     setSessionLogs([]);
+    setLatencyMs(null);
+    setAttachmentPreviews([]);
     resetAgentStatuses();
-    setCurrentView('chat');
-    setActiveTab('preview');
     setObjectiveProgress(0);
     setObjectiveStep(0);
     setCurrentObjective(null);
-    setSessionSummary(null);
     setSecurityScore(99.8);
 
     const nextSessionId = createSessionId();
@@ -567,52 +374,21 @@ export default function App() {
       }
     }
     setSessionId(nextSessionId);
-    void persistSessionState({
-      sessionId: nextSessionId,
-      currentObjective: null,
-      sessionSummary: null,
-      objectiveStep: 0,
-      objectiveProgress: 0,
-      currentView: 'chat',
-      activeTab: 'preview',
-    });
   };
 
   const handleSend = async () => {
-    const trimmedMessage = message.trim();
-    const selectedAttachments = attachments.map((attachment) => ({ ...attachment }));
-    const hasAttachments = selectedAttachments.length > 0;
-    if ((!trimmedMessage && !hasAttachments) || isLoading || isPreparingAttachments) return;
+    const selectedAttachments = attachmentPreviews;
 
-    const compactPrompt = trimmedMessage.replace(/\s+/g, ' ').trim();
-
-    let nextCurrentObjective = currentObjective;
-
-    if (!currentObjective && compactPrompt) {
-      const capturedObjective = captureObjectiveFromMessage(compactPrompt);
-      if (capturedObjective) {
-        nextCurrentObjective = capturedObjective;
-        setCurrentObjective(nextCurrentObjective);
+    try {
+      await sendPrompt(message, selectedAttachments);
+    } finally {
+      if (selectedAttachments.length > 0) {
+        setAttachmentPreviews([]);
+        if (attachmentInputRef.current) {
+          attachmentInputRef.current.value = '';
+        }
       }
     }
-
-    const nextObjectiveStep = Math.min(objectiveStep + 1, 5);
-    const nextObjectiveProgress = Math.min(objectiveProgress + 20, 100);
-
-    clearAttachments();
-    resetAgentStatuses();
-    setMessage('');
-    setObjectiveStep(nextObjectiveStep);
-    setObjectiveProgress(nextObjectiveProgress);
-
-    void persistSessionState({
-      currentObjective: nextCurrentObjective,
-      sessionSummary,
-      objectiveStep: nextObjectiveStep,
-      objectiveProgress: nextObjectiveProgress,
-    });
-
-    await sendMessage(trimmedMessage, { attachments: selectedAttachments });
   };
 
   const handleExecuteWorkspace = async () => {
@@ -632,109 +408,7 @@ export default function App() {
     setIsExecutingWorkspace(true);
     pushSessionLog('Execution workspace declenchee...', 'info');
     showWorkspaceNotice('info', 'Execution en cours via l\'orchestrateur.');
-    try {
-      await sendMessage(executionPrompt);
-    } finally {
-      setIsExecutingWorkspace(false);
-    }
-  };
-
-  // GESTION DU MICRO
-  const toggleRecording = async () => {
-    if (isRecording) {
-      mediaRecorderRef.current?.stop();
-      setIsRecording(false);
-    } else {
-      try {
-        if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error('MEDIA_DEVICES_UNAVAILABLE');
-        }
-
-        if (typeof MediaRecorder === 'undefined') {
-          throw new Error('MEDIA_RECORDER_UNSUPPORTED');
-        }
-
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const selectedMimeType = pickRecorderMimeType();
-        const mediaRecorder = selectedMimeType
-          ? new MediaRecorder(stream, { mimeType: selectedMimeType })
-          : new MediaRecorder(stream);
-        mediaRecorderRef.current = mediaRecorder;
-        recorderMimeTypeRef.current = mediaRecorder.mimeType || selectedMimeType || 'audio/webm';
-        audioChunksRef.current = [];
-
-        mediaRecorder.ondataavailable = (e) => {
-          if (e.data.size > 0) audioChunksRef.current.push(e.data);
-        };
-
-        mediaRecorder.onstop = async () => {
-          const firstChunkType = audioChunksRef.current.find((chunk) => chunk.type)?.type || '';
-          const mimeType = firstChunkType || recorderMimeTypeRef.current || 'audio/webm';
-          const fileExtension = getAudioExtensionFromMime(mimeType);
-          const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-          stream.getTracks().forEach((track) => track.stop());
-
-          if (audioBlob.size === 0) {
-            pushSessionLog('Aucun son detecte durant l’enregistrement.', 'warn');
-            return;
-          }
-
-          const formData = new FormData();
-          formData.append('audio', audioBlob, 'voice.' + fileExtension);
-
-          const oldMessage = message;
-          setMessage('Transcription en cours...');
-          pushSessionLog('Envoi audio vers Afri-ASR...');
-
-          try {
-            const authHeaders = await getAuthorizationHeaders();
-            const res = await fetch(`${API_BASE_URL}/api/transcribe`, {
-              method: 'POST',
-              headers: authHeaders,
-              body: formData,
-            });
-
-            if (!res.ok) {
-              const { code, message: apiMessage } = await readErrorPayload(res);
-              throw new Error(`${code}: ${apiMessage}`);
-            }
-
-            const data = await res.json();
-            const transcriptText = typeof data?.text === 'string' ? data.text.trim() : '';
-
-            if (transcriptText) {
-              setMessage(oldMessage + (oldMessage ? ' ' : '') + transcriptText);
-              pushSessionLog('Transcription terminee.', 'success');
-            } else {
-              setMessage(oldMessage);
-              pushSessionLog('Aucun texte exploitable detecte.', 'warn');
-            }
-          } catch (err) {
-            const errorMessage = err instanceof Error ? err.message : 'Erreur inconnue';
-            console.error('Transcription audio echouee:', err);
-            setMessage(oldMessage);
-            pushSessionLog('Transcription impossible: ' + errorMessage, 'warn');
-            alert('Transcription impossible: ' + errorMessage);
-          }
-        };
-
-        mediaRecorder.start();
-        setIsRecording(true);
-        pushSessionLog('Enregistrement micro demarre...');
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : '';
-        console.error('Acces micro refuse ou indisponible:', err);
-
-        if (reason === 'MEDIA_RECORDER_UNSUPPORTED' || reason === 'MEDIA_DEVICES_UNAVAILABLE') {
-          pushSessionLog('Navigateur non compatible enregistrement audio.', 'warn');
-          alert('Votre navigateur ne supporte pas l\'enregistrement audio. Utilisez Chrome ou Edge recents.');
-          return;
-        }
-
-        pushSessionLog('Acces micro refuse. Autorisez le micro puis recommencez.', 'warn');
-        alert('Veuillez autoriser l\'acces au microphone dans votre navigateur.');
-      }
-    }
+    await sendPrompt(executionPrompt);
   };
 
   return (
@@ -795,14 +469,38 @@ export default function App() {
             </button>
           </nav>
 
-          <SessionSidebar
-            objective={currentObjective}
-            agentStatuses={agentStatuses}
-            isDarkMode={isDarkMode}
-            objectiveProgress={objectiveProgress}
-            completedSteps={completedSteps}
-            sessionSummary={sessionSummary}
-          />
+                    <div className="mb-6">
+            <div className={`flex items-center gap-2 ${isDarkMode ? 'text-white/20' : 'text-purple-950/60'} uppercase text-[9px] font-black tracking-widest px-2 mb-4`}>
+              <Target className="w-3 h-3" />
+              <span>Mes Objectifs</span>
+            </div>
+
+            {currentObjective ? (
+              <motion.div
+                whileHover={{ y: -2 }}
+                className={`rounded-[24px] p-5 mb-4 border transition-all cursor-pointer relative overflow-hidden group shadow-2xl ${isDarkMode ? 'bg-[#150925] border-white/5' : 'bg-white/80 border-purple-200'}`}
+              >
+                <div className="flex justify-between items-start mb-3 relative z-10">
+                  <span className={`font-semibold text-xs ${isDarkMode ? 'text-gray-300' : 'text-purple-900'}`}>{currentObjective}</span>
+                  <span className="px-2 py-0.5 bg-purple-500/20 text-purple-600 dark:text-purple-300 rounded-full text-[9px] font-black tracking-tighter">{objectiveProgress}%</span>
+                </div>
+                <div className={`w-full h-1.5 rounded-full overflow-hidden mb-3 relative z-10 ${isDarkMode ? 'bg-white/5' : 'bg-purple-100'}`}>
+                  <motion.div
+                    initial={{ width: 0 }}
+                    animate={{ width: String(objectiveProgress) + '%' }}
+                    transition={{ duration: 1.5, ease: 'easeOut', delay: 0.5 }}
+                    className="gradient-vibrant h-full rounded-full"
+                  />
+                </div>
+                <div className={`flex items-center gap-2 text-[10px] relative z-10 ${isDarkMode ? 'text-white/20' : 'text-purple-900/30'}`}>
+                  <Trophy className="w-3 h-3 text-purple-400/40" />
+                  <span className="font-medium">{completedSteps} sur 5 etapes completees</span>
+                </div>
+              </motion.div>
+            ) : (
+              <p className="text-xs text-gray-400 italic mt-2">Aucun objectif en cours</p>
+            )}
+          </div>
           <div className="mt-auto relative">
             <SignedOut>
               <SignInButton mode='modal'>
@@ -871,115 +569,23 @@ export default function App() {
 
         <div className="flex-1 p-10 flex flex-col items-center justify-center relative overflow-hidden">
           {currentView === 'dashboard' ? (
-            <div className={`w-full max-w-6xl relative z-10 rounded-3xl border p-8 md:p-10 ${isDarkMode ? 'bg-white/5 border-white/10 text-gray-200' : 'bg-white border-purple-100 text-slate-700'}`}>
-              <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
-                <div>
-                  <h2 className={`text-2xl md:text-3xl font-serif tracking-tight ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>
-                    Tableau de bord opérationnel
-                  </h2>
-                  <p className={`text-xs mt-1 ${isDarkMode ? 'text-white/50' : 'text-slate-500'}`}>
-                    Etat backend, compteurs plateforme et indicateurs de session.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void refreshBackendSnapshot()}
-                  disabled={isRefreshingSnapshot}
-                  className={`px-4 py-2 rounded-xl border text-xs font-bold tracking-wide transition-colors ${
-                    isRefreshingSnapshot
-                      ? `${isDarkMode ? 'bg-white/5 border-white/10 text-white/40' : 'bg-slate-100 border-slate-200 text-slate-400'} cursor-not-allowed`
-                      : `${isDarkMode ? 'bg-purple-500/10 border-purple-400/30 text-purple-200 hover:bg-purple-500/20' : 'bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100'}`
-                  }`}
-                >
-                  {isRefreshingSnapshot ? 'Synchronisation...' : 'Rafraîchir'}
-                </button>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
-                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Health</div>
-                  <div className={`mt-2 text-xl font-semibold ${backendSnapshot.health === 'ok' ? (isDarkMode ? 'text-green-400' : 'text-green-600') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
-                    {backendSnapshot.health.toUpperCase()}
-                  </div>
-                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>maj: {formatSnapshotTime(backendSnapshot.updatedAt)}</div>
-                </div>
-
-                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Readiness</div>
-                  <div className={`mt-2 text-xl font-semibold ${backendSnapshot.ready === 'ready' ? (isDarkMode ? 'text-green-400' : 'text-green-600') : backendSnapshot.ready === 'degraded' ? (isDarkMode ? 'text-amber-400' : 'text-amber-600') : (isDarkMode ? 'text-red-400' : 'text-red-600')}`}>
-                    {backendSnapshot.ready.toUpperCase()}
-                  </div>
-                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>mode: {backendSnapshot.mode}</div>
-                </div>
-
-                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Database</div>
-                  <div className={`mt-2 text-xl font-semibold ${isDarkMode ? 'text-purple-300' : 'text-purple-700'}`}>
-                    {backendSnapshot.databaseStatus.toUpperCase()}
-                  </div>
-                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>raison: {shrinkText(backendSnapshot.reason, 55) || '--'}</div>
-                </div>
-
-                <div className={`rounded-2xl border p-4 ${isDarkMode ? 'bg-white/5 border-white/10' : 'bg-white border-purple-100'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Session</div>
-                  <div className={`mt-2 text-xl font-semibold ${isDarkMode ? 'text-white' : 'text-slate-800'}`}>{totalMessages}</div>
-                  <div className={`text-xs mt-1 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>messages totaux</div>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                <div className={`rounded-2xl border p-5 ${isDarkMode ? 'bg-black/20 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black mb-4 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Compteurs backend</div>
-                  <div className="grid grid-cols-2 gap-3 text-sm">
-                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
-                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>HTTP req</div>
-                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.httpRequestsTotal)}</div>
-                    </div>
-                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
-                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Orchestrator</div>
-                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.orchestratorCallsTotal)}</div>
-                    </div>
-                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
-                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Provider errs</div>
-                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.providerErrorsTotal)}</div>
-                    </div>
-                    <div className={`rounded-xl p-3 border ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-slate-200 bg-white'}`}>
-                      <div className={`text-[10px] uppercase font-bold ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>Auth fails</div>
-                      <div className="mt-1 font-semibold">{formatCounter(metricsSnapshot.authFailuresTotal)}</div>
-                    </div>
-                  </div>
-                  <div className={`text-xs mt-4 ${metricsSnapshot.error ? (isDarkMode ? 'text-amber-300' : 'text-amber-700') : (isDarkMode ? 'text-white/40' : 'text-slate-500')}`}>
-                    {metricsSnapshot.error || `Dernière collecte: ${formatSnapshotTime(metricsSnapshot.updatedAt)}`}
-                  </div>
-                </div>
-
-                <div className={`rounded-2xl border p-5 ${isDarkMode ? 'bg-black/20 border-white/10' : 'bg-slate-50 border-slate-200'}`}>
-                  <div className={`text-[10px] uppercase tracking-[0.2em] font-black mb-4 ${isDarkMode ? 'text-white/40' : 'text-slate-500'}`}>KPI conversation</div>
-                  <div className="space-y-3 text-sm">
-                    <div className="flex items-center justify-between">
-                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Messages utilisateur</span>
-                      <span className="font-semibold">{userMessagesCount}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Réponses assistant</span>
-                      <span className="font-semibold">{assistantMessagesCount}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Erreurs UI/API</span>
-                      <span className={`font-semibold ${failedMessagesCount > 0 ? (isDarkMode ? 'text-red-400' : 'text-red-600') : ''}`}>{failedMessagesCount}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Latence observée</span>
-                      <span className="font-semibold">{latencyMs !== null ? `${latencyMs.toFixed(1)}ms` : '--'}</span>
-                    </div>
-                    <div className="flex items-center justify-between">
-                      <span className={isDarkMode ? 'text-white/60' : 'text-slate-600'}>Logs session</span>
-                      <span className="font-semibold">{sessionLogs.length}</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
+            <DashboardView
+              backendSnapshot={backendSnapshot}
+              metricsSnapshot={metricsSnapshot}
+              isRefreshingSnapshot={isRefreshingSnapshot}
+              refreshBackendSnapshot={refreshBackendSnapshot}
+              onClose={() => setCurrentView('chat')}
+              formatSnapshotTime={formatSnapshotTime}
+              formatCounter={formatCounter}
+              shrinkText={shrinkText}
+              totalMessages={totalMessages}
+              userMessagesCount={userMessagesCount}
+              assistantMessagesCount={assistantMessagesCount}
+              failedMessagesCount={failedMessagesCount}
+              latencyMs={latencyMs}
+              sessionLogsCount={sessionLogs.length}
+              isDarkMode={isDarkMode}
+            />
           ) : (
           <AnimatePresence mode="wait">
             {messages.length === 0 ? (
@@ -1015,12 +621,65 @@ export default function App() {
                 </p>
               </motion.div>
             ) : (
-              <ChatMessages
-                messages={messages}
-                isDarkMode={isDarkMode}
-                isLoading={isLoading}
-                userImageUrl={user?.imageUrl}
-              />
+              <motion.div 
+                key="chat"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="w-full h-full flex flex-col gap-6 overflow-y-auto custom-scrollbar p-6 relative z-10 mx-auto"
+              >
+                {messages.map((m, index) => {
+                  const isUserMessage = m.role === 'user';
+                  const isAssistantMessage = m.role === 'assistant';
+                  const isErrorMessage = m.role === 'system' && m.tone === 'error';
+
+                  return (
+                  <div key={index} className={`flex gap-4 ${isUserMessage ? 'justify-end' : ''}`}>
+                    {isAssistantMessage && (
+                      <div className="w-10 h-10 rounded-full bg-purple-500/10 flex items-center justify-center text-purple-500 border border-purple-500/20 shrink-0">
+                        <Brain size={18} />
+                      </div>
+                    )}
+
+                    {isErrorMessage && (
+                      <div className="w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center text-red-400 border border-red-500/30 shrink-0">
+                        <AlertTriangle size={18} />
+                      </div>
+                    )}
+                    
+                    <div className={`text-sm leading-relaxed markdown-body ${markdownBubbleClass} ${
+                      isUserMessage
+                        ? 'w-fit max-w-[80%] px-4 py-2 rounded-2xl bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-br-none shadow-lg shadow-purple-500/20 whitespace-pre-wrap break-words'
+                        : isErrorMessage
+                          ? `w-fit max-w-[80%] px-4 py-2 rounded-2xl rounded-bl-none ${isDarkMode ? 'bg-red-500/10 border border-red-500/40 text-red-100' : 'bg-red-50 border border-red-200 text-red-700'}`
+                          : `w-fit max-w-[80%] px-4 py-2 rounded-2xl rounded-bl-none ${isDarkMode ? 'bg-white/5 border border-white/10 text-gray-200' : 'bg-white border border-purple-100 text-slate-700 shadow-sm'}`
+                    }`}>
+                      {isUserMessage ? (
+                        <div className="whitespace-pre-wrap break-words">{m.content}</div>
+                      ) : (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{(m.content || '').replace(/\\n/g, '\n')}</ReactMarkdown>
+                      )}
+                    </div>
+                    
+                    {isUserMessage && (
+                      <div className="w-10 h-10 rounded-full bg-gray-900 flex items-center justify-center border border-white/10 overflow-hidden shrink-0 shadow-lg">
+                        <img src={user?.imageUrl || "https://picsum.photos/seed/userelegant/100/100"} alt="Avatar user" className="w-full h-full object-cover" />
+                      </div>
+                    )}
+                  </div>
+                  );
+                })}
+                
+                {isLoading && (
+                  <div className="flex gap-4">
+                    <div className="w-10 h-10 rounded-full bg-purple-500/10 flex items-center justify-center text-purple-500 border border-purple-500/20 shrink-0 animate-pulse">
+                      <Brain size={18} />
+                    </div>
+                    <div className={`p-5 rounded-[24px] rounded-bl-none italic text-sm border ${isDarkMode ? 'bg-white/5 border-white/10 text-gray-400' : 'bg-white border-purple-100 text-slate-500'}`}>
+                      L'Orchestrateur réfléchit...
+                    </div>
+                  </div>
+                )}
+              </motion.div>
             )}          </AnimatePresence>
           )}
         </div>
@@ -1036,29 +695,87 @@ export default function App() {
               <div className='w-full text-center p-4 glass rounded-2xl text-[var(--text-dim)] text-sm'>Veuillez vous connecter pour instruire MindMesh.</div>
             </SignedOut>
             <SignedIn>
-              <ChatComposer
-                message={message}
-                attachments={attachments}
-                attachmentInputRef={attachmentInputRef}
-                isDarkMode={isDarkMode}
-                isRecording={isRecording}
-                isPreparingAttachments={isPreparingAttachments}
-                isLoading={isLoading}
-                onMessageChange={(value) => {
-                  const nextInput = value;
-                  setMessage(nextInput);
-                  setSecurityScore(evaluatePromptSecurity(nextInput));
-                }}
-                onSendMessage={handleSend}
-                onToggleRecording={toggleRecording}
-                onAttachmentSelection={handleAttachmentSelection}
-              />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ delay: 0.7 }}
+              className="w-full relative group"
+            >
+              <div className={`absolute -inset-0.5 bg-gradient-to-r from-purple-500/20 to-pink-500/20 rounded-[32px] blur opacity-0 group-focus-within:opacity-100 transition-opacity duration-700`} />
+              <div className={`relative glass-heavy h-20 rounded-[32px] border ${isDarkMode ? 'border-white/5 bg-black/20' : 'border-purple-200 bg-white/80'} flex items-center p-2 group-focus-within:border-purple-400 transition-all duration-300 shadow-2xl`}>
+                
+                <button 
+                  type="button"
+                  onClick={toggleRecording}
+                  className={`h-full px-6 flex items-center justify-center transition-colors relative ${
+                    isRecording 
+                      ? 'text-red-500' 
+                      : `${isDarkMode ? 'text-white/40 hover:text-white' : 'text-purple-900/40 hover:text-purple-600'}`
+                  }`}
+                >
+                  {isRecording && (
+                    <div className="absolute w-6 h-6 bg-red-500/30 rounded-full animate-ping" />
+                  )}
+                  <Mic className="w-5 h-5 relative z-10" />
+                </button>
 
-              {isPreparingAttachments && (
-                <div className={`mt-2 text-xs font-medium ${isDarkMode ? 'text-purple-200' : 'text-purple-700'}`}>
-                  Préparation des pièces jointes...
+                <button type="button" onClick={() => attachmentInputRef.current?.click()} className="p-2 text-purple-400 hover:text-purple-600 transition-colors">
+                  <Paperclip className="w-5 h-5" />
+                </button>
+
+                <input type="file" multiple className="hidden" ref={attachmentInputRef} onChange={onAttachmentSelection} accept={CHAT_ATTACHMENT_ACCEPT} />
+
+                <div className="flex-1 min-w-0 flex items-center gap-2 px-2">
+                  {attachmentPreviews.length > 0 && (
+                    <div className={`flex items-center gap-2 shrink-0 max-w-[42%] overflow-x-auto text-[10px] ${isDarkMode ? 'text-white/50' : 'text-slate-500'}`}>
+                      {attachmentPreviews.map((attachment) => (
+                        <span
+                          key={attachment.id}
+                          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 whitespace-nowrap ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-100 bg-white'}`}
+                        >
+                          <span className="font-semibold truncate max-w-[8rem]">{attachment.name}</span>
+                          <span>{formatAttachmentSize(attachment.size)}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeAttachment(attachment.id)}
+                            className={`${isDarkMode ? 'text-white/40 hover:text-white' : 'text-slate-400 hover:text-slate-700'} transition-colors`}
+                            aria-label={`Retirer ${attachment.name}`}
+                          >
+                            <X className="w-3 h-3" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <input 
+                    type="text" 
+                    ref={messageInputRef}
+                    value={message}
+                    onChange={(e) => {
+                      const nextInput = e.target.value;
+                      setMessage(nextInput);
+                      setSecurityScore(evaluatePromptSecurity(nextInput));
+                    }}
+                    onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
+                    placeholder={isRecording ? "Écoute en cours (Cliquez pour arrêter)..." : "Instruire MindMesh..."}
+                    disabled={isRecording}
+                    className={`flex-1 min-w-0 bg-transparent border-none outline-none text-lg ${isDarkMode ? 'placeholder:text-white/40 text-white' : 'placeholder:text-slate-500 text-slate-800'} px-2 font-medium w-full`}
+                  />
                 </div>
-              )}
+                
+                <button 
+                  type="button"
+                  onClick={handleSend}
+                  disabled={isLoading || !message.trim() || isRecording}
+                  className={`w-14 h-14 gradient-vibrant rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/40 transition-all duration-300 shrink-0 ${
+                    isLoading || !message.trim() || isRecording ? 'opacity-50 scale-100 cursor-not-allowed' : 'hover:scale-105 active:scale-95'
+                  }`}
+                >
+                  <Send className="w-5 h-5 text-white" />
+                </button>
+              </div>
+            </motion.div>
             </SignedIn>
           </div>
         </div>
@@ -1148,6 +865,51 @@ export default function App() {
                       <code>{latestAssistantMessage || '// Aucune réponse disponible pour le moment.'}</code>
                     </pre>
                   )}
+                </div>
+              </div>
+
+              <div className="px-10 py-8">
+                <h3 className={`text-[9px] font-black tracking-[0.3em] uppercase ${isDarkMode ? 'text-white/20' : 'text-purple-900/40'} mb-8 flex items-center gap-3 transition-colors`}>
+                  <Activity className="w-4 h-4 text-purple-400/60" />
+                  ÉQUIPE MOBILISÉE
+                </h3>
+
+                <div className="space-y-4">
+                  {agents.map((agent) => {
+                    const isAgentActive = agentStatuses[agent.id] === 'working';
+                    return (
+                    <motion.div 
+                      key={agent.id}
+                      initial={{ opacity: 0, x: 10 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      whileHover={{ x: 4 }}
+                      className={`border p-5 rounded-[28px] flex items-center gap-5 group transition-all cursor-pointer relative shadow-xl ${
+                        isDarkMode 
+                          ? 'bg-white/5 border-white/10 hover:bg-white/10 shadow-black/40' 
+                          : 'bg-white/60 border-purple-200 hover:bg-purple-50 shadow-purple-500/10'
+                      }`}
+                    >
+                      <div className={`w-12 h-12 rounded-2xl flex items-center justify-center transition-all duration-500 ${
+                        isAgentActive
+                          ? 'border-purple-500/30 bg-purple-500/10' 
+                          : `${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-200 bg-white'}`
+                      }`}>
+                        <agent.icon className={`w-5 h-5 transition-colors duration-500 ${isAgentActive ? 'text-purple-500' : `${isDarkMode ? 'text-white/30' : 'text-purple-900/30'}`}`} />
+                      </div>
+                      <div className="flex-1">
+                        <div className={`font-bold text-sm mb-0.5 tracking-tight group-hover:text-purple-600 transition-colors ${isDarkMode ? 'text-white' : 'text-purple-950'}`}>{agent.name}</div>
+                        <div className={`text-[10px] ${isDarkMode ? 'text-white/40' : 'text-purple-900/60'} font-medium tracking-wide`}>{agent.role}</div>
+                      </div>
+                      <div className={`px-4 py-1.5 rounded-xl text-[9px] font-black tracking-widest uppercase border transition-all ${
+                        isAgentActive
+                          ? `bg-purple-500/10 border-purple-500/30 animate-pulse ${isDarkMode ? 'text-purple-300' : 'text-purple-600'}` 
+                          : `${isDarkMode ? 'bg-white/5 border-white/10 text-white/30' : 'bg-purple-100 border-purple-200 text-purple-900/60'}`
+                      }`}>
+                        {isAgentActive ? 'WORKING' : 'IDLE'}
+                      </div>
+                    </motion.div>
+                    );
+                  })}
                 </div>
               </div>
 

@@ -1,48 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
+import type { BackendSnapshot, MetricsSnapshot } from '../lib/appTypes';
+import { readPromCounterValue } from '../lib/appUtils';
 
-interface BackendSnapshot {
-  health: 'ok' | 'down' | 'unknown';
-  ready: 'ready' | 'degraded' | 'down' | 'unknown';
-  mode: string;
-  databaseStatus: string;
-  reason: string;
-  updatedAt: number | null;
-}
-
-interface MetricsSnapshot {
-  httpRequestsTotal: number | null;
-  orchestratorCallsTotal: number | null;
-  providerErrorsTotal: number | null;
-  authFailuresTotal: number | null;
-  error: string | null;
-  updatedAt: number | null;
-}
-
-const readPromCounterValue = (metricsRaw: string, metricName: string): number | null => {
-  const pattern = new RegExp(`^${metricName}(?:\\{[^}]*\\})?\\s+(-?\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?)$`, 'gim');
-  let total = 0;
-  let found = false;
-  let match: RegExpExecArray | null = pattern.exec(metricsRaw);
-
-  while (match) {
-    const parsed = Number(match[1]);
-    if (Number.isFinite(parsed)) {
-      total += parsed;
-      found = true;
-    }
-    match = pattern.exec(metricsRaw);
-  }
-
-  return found ? total : null;
+const isRecord = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null;
 };
 
-export const useBackendSnapshot = ({
-  apiBaseUrl,
-  getMetricsHeaders,
-}: {
+interface UseBackendSnapshotArgs {
   apiBaseUrl: string;
   getMetricsHeaders: () => Promise<Record<string, string>>;
-}) => {
+}
+
+export const useBackendSnapshot = ({ apiBaseUrl, getMetricsHeaders }: UseBackendSnapshotArgs) => {
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
   const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot>({
     health: 'unknown',
@@ -59,6 +28,7 @@ export const useBackendSnapshot = ({
     authFailuresTotal: null,
     error: null,
     updatedAt: null,
+    status: 'unknown',
   });
 
   const refreshBackendSnapshot = useCallback(async () => {
@@ -70,24 +40,32 @@ export const useBackendSnapshot = ({
         fetch(`${apiBaseUrl}/readyz`),
       ]);
 
-      let healthPayload: any = null;
-      let readyPayload: any = null;
+      let healthPayload: Record<string, unknown> | null = null;
+      let readyPayload: Record<string, unknown> | null = null;
 
       if (healthResponse.ok) {
         try {
-          healthPayload = await healthResponse.json();
+          const candidate: unknown = await healthResponse.json();
+          healthPayload = isRecord(candidate) ? candidate : null;
         } catch {
           healthPayload = null;
         }
       }
 
       try {
-        readyPayload = await readyResponse.json();
+        const candidate: unknown = await readyResponse.json();
+        readyPayload = isRecord(candidate) ? candidate : null;
       } catch {
         readyPayload = null;
       }
 
-      const health: BackendSnapshot['health'] = healthResponse.ok && healthPayload?.status === 'ok' ? 'ok' : 'down';
+      const healthStatus = typeof healthPayload?.status === 'string' ? healthPayload.status : '';
+      const health: BackendSnapshot['health'] = healthResponse.ok && healthStatus === 'ok' ? 'ok' : 'down';
+
+      const readyDatabaseCandidate = readyPayload?.database;
+      const healthDatabaseCandidate = healthPayload?.database;
+      const readyDatabase = isRecord(readyDatabaseCandidate) ? readyDatabaseCandidate : null;
+      const healthDatabase = isRecord(healthDatabaseCandidate) ? healthDatabaseCandidate : null;
 
       const ready: BackendSnapshot['ready'] = (() => {
         if (!readyResponse.ok) return 'down';
@@ -101,8 +79,8 @@ export const useBackendSnapshot = ({
         ready,
         mode: typeof readyPayload?.mode === 'string' ? readyPayload.mode : 'unknown',
         databaseStatus:
-          (typeof readyPayload?.database?.status === 'string' && readyPayload.database.status) ||
-          (typeof healthPayload?.database?.status === 'string' && healthPayload.database.status) ||
+          (typeof readyDatabase?.status === 'string' && readyDatabase.status) ||
+          (typeof healthDatabase?.status === 'string' && healthDatabase.status) ||
           'unknown',
         reason:
           (typeof readyPayload?.reason === 'string' && readyPayload.reason) ||
@@ -123,20 +101,24 @@ export const useBackendSnapshot = ({
 
     try {
       const metricsHeaders = await getMetricsHeaders();
-      const metricsResponse = await fetch(`${apiBaseUrl}/metrics`, {
+      const metricsResponse = await fetch(`${apiBaseUrl}/api/internal-metrics`, {
         headers: metricsHeaders,
       });
 
       if (!metricsResponse.ok) {
         const statusHint =
           metricsResponse.status === 401
-            ? 'Acces /metrics protege (configure VITE_METRICS_ADMIN_TOKEN).'
+            ? 'Acces metrics non autorise.'
             : `Impossible de lire /metrics (${metricsResponse.status}).`;
-        setMetricsSnapshot((prev) => ({
-          ...prev,
+        setMetricsSnapshot({
+          httpRequestsTotal: null,
+          orchestratorCallsTotal: null,
+          providerErrorsTotal: null,
+          authFailuresTotal: null,
           error: statusHint,
           updatedAt: Date.now(),
-        }));
+          status: 'unknown',
+        });
       } else {
         const metricsRaw = await metricsResponse.text();
         setMetricsSnapshot({
@@ -146,15 +128,20 @@ export const useBackendSnapshot = ({
           authFailuresTotal: readPromCounterValue(metricsRaw, 'mindmesh_auth_failures_total'),
           error: null,
           updatedAt: Date.now(),
+          status: 'ready',
         });
       }
     } catch (error) {
       console.error('Snapshot metrics indisponible:', error);
-      setMetricsSnapshot((prev) => ({
-        ...prev,
+      setMetricsSnapshot({
+        httpRequestsTotal: null,
+        orchestratorCallsTotal: null,
+        providerErrorsTotal: null,
+        authFailuresTotal: null,
         error: 'Lecture metrics impossible (reseau ou credentials).',
         updatedAt: Date.now(),
-      }));
+        status: 'unknown',
+      });
     } finally {
       setIsRefreshingSnapshot(false);
     }
@@ -169,10 +156,5 @@ export const useBackendSnapshot = ({
     return () => window.clearInterval(interval);
   }, [refreshBackendSnapshot]);
 
-  return {
-    backendSnapshot,
-    isRefreshingSnapshot,
-    metricsSnapshot,
-    refreshBackendSnapshot,
-  };
+  return { backendSnapshot, metricsSnapshot, isRefreshingSnapshot, refreshBackendSnapshot };
 };
