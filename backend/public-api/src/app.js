@@ -1,6 +1,9 @@
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 import pinoHttp from 'pino-http';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
@@ -13,7 +16,17 @@ import { transcribeRouter } from './routes/transcribe.routes.js';
 import { metricsMiddleware } from './services/metrics.service.js';
 
 const buildCorsOptions = () => {
-  const allowed = new Set(env.corsAllowedOrigins);
+  const rawAllowedOrigins = typeof process.env.CORS_ALLOWED_ORIGINS === 'string' ? process.env.CORS_ALLOWED_ORIGINS : '';
+  const allowed = new Set(
+    rawAllowedOrigins
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
+  );
+
+  if (allowed.size === 0 && !env.isProd) {
+    env.corsAllowedOrigins.forEach((origin) => allowed.add(origin));
+  }
 
   return {
     origin: (origin, callback) => {
@@ -27,6 +40,9 @@ const buildCorsOptions = () => {
 
 export const createApp = () => {
   const app = express();
+  const frontendDistPath = fileURLToPath(new URL('../../../dist', import.meta.url));
+  const frontendIndexPath = path.join(frontendDistPath, 'index.html');
+  const hasFrontendBuild = existsSync(frontendIndexPath);
 
   app.set('trust proxy', env.trustProxyLevel);
   app.use(requestIdMiddleware);
@@ -56,6 +72,15 @@ export const createApp = () => {
   app.use('/api/voice', voiceRouter);
   app.use('/api', transcribeRouter);
   app.use('/', healthRouter);
+
+  if (hasFrontendBuild) {
+    app.use(express.static(frontendDistPath, { index: false }));
+    app.get(/^(?!\/api\/).*/, (req, res, next) => {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+      if (!req.accepts('html')) return next();
+      return res.sendFile(frontendIndexPath);
+    });
+  }
 
   app.use(notFoundHandler);
   app.use(errorHandler);

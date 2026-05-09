@@ -1,3 +1,4 @@
+import os from 'node:os';
 import multer from 'multer';
 import { Router } from 'express';
 import { env } from '../config/env.js';
@@ -10,7 +11,7 @@ import { transcribeUploadedAudio } from '../services/transcribe.service.js';
 import { AppError } from '../utils/errors.js';
 
 const upload = multer({
-  dest: 'uploads/',
+  dest: os.tmpdir(),
   limits: {
     fileSize: env.transcribeMaxBytes,
     files: 1,

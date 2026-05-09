@@ -9,9 +9,10 @@ const isRecord = (value: unknown): value is Record<string, unknown> => {
 interface UseBackendSnapshotArgs {
   apiBaseUrl: string;
   getMetricsHeaders: () => Promise<Record<string, string>>;
+  canAccessMetrics?: boolean;
 }
 
-export const useBackendSnapshot = ({ apiBaseUrl, getMetricsHeaders }: UseBackendSnapshotArgs) => {
+export const useBackendSnapshot = ({ apiBaseUrl, getMetricsHeaders, canAccessMetrics = true }: UseBackendSnapshotArgs) => {
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState(false);
   const [backendSnapshot, setBackendSnapshot] = useState<BackendSnapshot>({
     health: 'unknown',
@@ -100,36 +101,49 @@ export const useBackendSnapshot = ({ apiBaseUrl, getMetricsHeaders }: UseBackend
     }
 
     try {
-      const metricsHeaders = await getMetricsHeaders();
-      const metricsResponse = await fetch(`${apiBaseUrl}/api/internal-metrics`, {
-        headers: metricsHeaders,
-      });
+      if (canAccessMetrics) {
+        const metricsHeaders = await getMetricsHeaders();
+        const metricsResponse = await fetch(`${apiBaseUrl}/api/internal-metrics`, {
+          headers: metricsHeaders,
+        });
 
-      if (!metricsResponse.ok) {
-        const statusHint =
-          metricsResponse.status === 401
-            ? 'Acces metrics non autorise.'
-            : `Impossible de lire /metrics (${metricsResponse.status}).`;
-        setMetricsSnapshot({
+        if (!metricsResponse.ok) {
+          const statusHint =
+            metricsResponse.status === 401
+              ? 'Acces metrics non autorise.'
+              : `Impossible de lire /metrics (${metricsResponse.status}).`;
+          setMetricsSnapshot({
+            httpRequestsTotal: null,
+            orchestratorCallsTotal: null,
+            providerErrorsTotal: null,
+            authFailuresTotal: null,
+            error: statusHint,
+            updatedAt: Date.now(),
+            status: 'unknown',
+          });
+        } else {
+          const metricsRaw = await metricsResponse.text();
+          setMetricsSnapshot({
+            httpRequestsTotal: readPromCounterValue(metricsRaw, 'mindmesh_http_requests_total'),
+            orchestratorCallsTotal: readPromCounterValue(metricsRaw, 'mindmesh_orchestrator_calls_total'),
+            providerErrorsTotal: readPromCounterValue(metricsRaw, 'mindmesh_provider_errors_total'),
+            authFailuresTotal: readPromCounterValue(metricsRaw, 'mindmesh_auth_failures_total'),
+            error: null,
+            updatedAt: Date.now(),
+            status: 'ready',
+          });
+        }
+      } else {
+        setMetricsSnapshot((prev) => ({
+          ...prev,
           httpRequestsTotal: null,
           orchestratorCallsTotal: null,
           providerErrorsTotal: null,
           authFailuresTotal: null,
-          error: statusHint,
-          updatedAt: Date.now(),
-          status: 'unknown',
-        });
-      } else {
-        const metricsRaw = await metricsResponse.text();
-        setMetricsSnapshot({
-          httpRequestsTotal: readPromCounterValue(metricsRaw, 'mindmesh_http_requests_total'),
-          orchestratorCallsTotal: readPromCounterValue(metricsRaw, 'mindmesh_orchestrator_calls_total'),
-          providerErrorsTotal: readPromCounterValue(metricsRaw, 'mindmesh_provider_errors_total'),
-          authFailuresTotal: readPromCounterValue(metricsRaw, 'mindmesh_auth_failures_total'),
           error: null,
           updatedAt: Date.now(),
           status: 'ready',
-        });
+        }));
       }
     } catch (error) {
       console.error('Snapshot metrics indisponible:', error);
@@ -145,7 +159,7 @@ export const useBackendSnapshot = ({ apiBaseUrl, getMetricsHeaders }: UseBackend
     } finally {
       setIsRefreshingSnapshot(false);
     }
-  }, [apiBaseUrl, getMetricsHeaders]);
+  }, [apiBaseUrl, canAccessMetrics, getMetricsHeaders]);
 
   useEffect(() => {
     void refreshBackendSnapshot();

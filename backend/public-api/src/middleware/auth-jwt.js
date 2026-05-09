@@ -56,12 +56,16 @@ const FALLBACK_READ_ONLY_SCOPES = ['read:only'];
 
 export const authJwtMiddleware = async (req, _res, next) => {
   try {
-    if (!env.authRequired || env.authBypass) {
+    if (!env.isProd && (!env.authRequired || env.authBypass)) {
       req.auth = {
         sub: req.headers['x-dev-user'] ? String(req.headers['x-dev-user']) : 'dev-user',
         scopes: env.authDefaultScopes,
         roles: ['dev'],
-        claims: {},
+        claims: {
+          metadata: {
+            role: 'admin',
+          },
+        },
       };
       return next();
     }

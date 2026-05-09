@@ -1,15 +1,19 @@
 ﻿import { useState, useEffect, useRef, useCallback, type ChangeEvent } from 'react';
 import { 
-  Plus, Target, Trophy, Brain, Send, Mic, Paperclip, X, Share2, Download, Play, Code, Eye,
+  Menu, Plus, Target, Trophy, Brain, Send, Mic, Paperclip, X, Share2, Download, Play, Code, Eye,
   Terminal, Activity, Globe, Search, Zap, LayoutDashboard,
   ShieldCheck, Cpu, Sun, Moon, AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { SignedIn, SignedOut, SignInButton, useAuth, useClerk, useUser } from '@clerk/clerk-react';
+import { SignedIn, useAuth, useClerk, useUser } from '@clerk/clerk-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useVoiceTranscription } from './hooks/useVoiceTranscription.ts';
+import AuthView from './components/AuthView';
+import AdminDashboardView from './components/AdminDashboardView';
 import DashboardView from './components/DashboardView';
+import PricingModal from './components/PricingModal';
+import SettingsView from './components/SettingsView';
 import { useBackendSnapshot } from './hooks/useBackendSnapshot';
 import { useChatHistory } from './hooks/useChatHistory';
 import { useChatPromptSender } from './hooks/useChatPromptSender';
@@ -33,9 +37,11 @@ import {
 } from './lib/appUtils';
 
 export default function App() {
-  const { signOut, openUserProfile } = useClerk();
+  const { signOut } = useClerk();
   const { getToken } = useAuth();
-  const { user } = useUser();
+  const { user, isLoaded } = useUser();
+  const isAdmin = user?.publicMetadata?.role === 'admin';
+  const [pathname, setPathname] = useState(() => (typeof window !== 'undefined' ? window.location.pathname : '/'));
   const getAuthorizationHeaders = useCallback(async (): Promise<Record<string, string>> => {
     try {
       const token = await getToken();
@@ -45,13 +51,23 @@ export default function App() {
     }
   }, [getToken]);
   const [showMenu, setShowMenu] = useState(false);
+  const [showPricingModal, setShowPricingModal] = useState(false);
+  const [showMobileSidebar, setShowMobileSidebar] = useState(false);
+  const [showMobileWorkspace, setShowMobileWorkspace] = useState(false);
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const [message, setMessage] = useState('');
   const [activeTab, setActiveTab] = useState<'preview' | 'code'>('preview');
-  const [isDarkMode, setIsDarkMode] = useState(true);
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    const storedTheme = window.localStorage.getItem('mindmesh-theme');
+    if (storedTheme === 'dark') return true;
+    if (storedTheme === 'light') return false;
+    return false;
+  });
   const [isLoading, setIsLoading] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const [sessionLogs, setSessionLogs] = useState<SessionLog[]>([]);
-  const [currentView, setCurrentView] = useState<'chat' | 'dashboard'>('chat');
+  const [currentView, setCurrentView] = useState<'chat' | 'dashboard' | 'dashboard-debug'>('chat');
   const [objectiveProgress, setObjectiveProgress] = useState(0);
   const [objectiveStep, setObjectiveStep] = useState(0);
   const [currentObjective, setCurrentObjective] = useState<string | null>(null);
@@ -68,6 +84,54 @@ export default function App() {
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const messageInputRef = useRef<HTMLInputElement | null>(null);
   const logsContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handlePopState = () => setPathname(window.location.pathname);
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  const navigate = useCallback((nextPath: string) => {
+    if (typeof window === 'undefined') return;
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+    setPathname(nextPath);
+    setShowMenu(false);
+    setShowMobileSidebar(false);
+    setShowMobileWorkspace(false);
+  }, []);
+
+  const handleSignOut = useCallback(async () => {
+    setShowMenu(false);
+    await signOut();
+    navigate('/sign-in');
+  }, [navigate, signOut]);
+
+  const currentPath = pathname !== '/' ? pathname.replace(/\/+$/, '') : pathname;
+  const isSignInRoute = currentPath === '/sign-in';
+  const isSignUpRoute = currentPath === '/sign-up';
+  const isSettingsRoute = currentPath === '/settings';
+
+  useEffect(() => {
+    setShowMenu(false);
+    setShowMobileSidebar(false);
+    setShowMobileWorkspace(false);
+  }, [currentPath]);
+
+  useEffect(() => {
+    if (!isLoaded) return;
+
+    if (user && (isSignInRoute || isSignUpRoute)) {
+      navigate('/');
+      return;
+    }
+
+    if (!user && currentPath !== '/sign-in' && currentPath !== '/sign-up') {
+      navigate('/sign-in');
+    }
+  }, [currentPath, isLoaded, isSignInRoute, isSignUpRoute, navigate, user]);
+
   const chatHistory = useChatHistory({
     apiBaseUrl: (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, ''),
     sessionId,
@@ -75,11 +139,10 @@ export default function App() {
   });
   const { messages, setMessages, loadChatHistory } = chatHistory;
   const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:4020').replace(/\/+$/, '');
-  const UPGRADE_URL = (import.meta.env.VITE_UPGRADE_URL || import.meta.env.VITE_BILLING_URL || '').trim();
-  const BILLING_URL = (import.meta.env.VITE_BILLING_URL || '').trim();
   const { backendSnapshot, metricsSnapshot, isRefreshingSnapshot, refreshBackendSnapshot } = useBackendSnapshot({
     apiBaseUrl: API_BASE_URL,
     getMetricsHeaders: getAuthorizationHeaders,
+    canAccessMetrics: isAdmin,
   });
 
   useEffect(() => {
@@ -90,6 +153,12 @@ export default function App() {
     if (!logsContainerRef.current) return;
     logsContainerRef.current.scrollTop = logsContainerRef.current.scrollHeight;
   }, [sessionLogs]);
+
+  useEffect(() => {
+    if (!isAdmin && currentView === 'dashboard-debug') {
+      setCurrentView('chat');
+    }
+  }, [currentView, isAdmin]);
 
   const latestAssistantMessage =
     [...messages].reverse().find((m) => m.role === 'assistant')?.content ?? '';
@@ -168,6 +237,12 @@ export default function App() {
   const removeAttachment = (attachmentId: string) => {
     setAttachmentPreviews((prev) => prev.filter((attachment) => attachment.id !== attachmentId));
     window.setTimeout(() => messageInputRef.current?.focus(), 0);
+  };
+
+  const closeMobilePanels = () => {
+    setShowMobileSidebar(false);
+    setShowMobileWorkspace(false);
+    setShowMenu(false);
   };
 
   const { sendPrompt } = useChatPromptSender({
@@ -257,41 +332,48 @@ export default function App() {
 
   const latestAssistantMarkdown = (latestAssistantMessage || 'Aucune réponse disponible pour le moment.').replace(/\\n/g, '\n');
 
-  const openExternalLink = (url: string, label: string) => {
-    if (!url) {
-      showWorkspaceNotice('warn', `${label} indisponible: URL non configuree.`);
-      return;
-    }
-
-    window.open(url, '_blank', 'noopener,noreferrer');
-    setShowMenu(false);
-    pushSessionLog(`${label} ouvert dans un nouvel onglet.`, 'success');
-    showWorkspaceNotice('success', `${label} ouvert.`);
-  };
-
   const handleOpenUpgrade = () => {
-    if (UPGRADE_URL) {
-      openExternalLink(UPGRADE_URL, 'Upgrade');
-      return;
-    }
-
-    openUserProfile();
     setShowMenu(false);
-    pushSessionLog('Profil utilisateur ouvert (fallback upgrade).', 'info');
-    showWorkspaceNotice('info', 'Espace upgrade ouvert via le profil utilisateur.');
+    setShowPricingModal(true);
   };
 
-  const handleOpenBilling = () => {
-    if (BILLING_URL) {
-      openExternalLink(BILLING_URL, 'Facturation');
-      return;
-    }
+  if (isSignInRoute) {
+    return <AuthView mode="sign-in" isDarkMode={isDarkMode} onNavigate={navigate} />;
+  }
 
-    openUserProfile();
-    setShowMenu(false);
-    pushSessionLog('Profil utilisateur ouvert (fallback facturation).', 'info');
-    showWorkspaceNotice('info', 'Espace facturation ouvert via le profil utilisateur.');
-  };
+  if (isSignUpRoute) {
+    return <AuthView mode="sign-up" isDarkMode={isDarkMode} onNavigate={navigate} />;
+  }
+
+  if (!isLoaded) {
+    return (
+      <div className="relative flex min-h-dvh items-center justify-center overflow-hidden bg-[var(--background)] text-[var(--text)]">
+        <div className="absolute inset-0 bg-dot-grid opacity-60" />
+        <div className="absolute -right-40 top-[-140px] h-[520px] w-[520px] rounded-full bg-purple-600/20 blur-[140px]" />
+        <div className="absolute -left-44 bottom-[-180px] h-[560px] w-[560px] rounded-full bg-pink-500/10 blur-[160px]" />
+        <div className="relative flex flex-col items-center gap-4 rounded-[32px] border border-white/10 bg-white/5 px-8 py-10 shadow-[0_30px_120px_rgba(15,23,42,0.24)] backdrop-blur-2xl">
+          <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/10 text-purple-200">
+            <Brain className="h-7 w-7 animate-pulse" />
+          </div>
+          <div className="text-center">
+            <div className="text-[10px] font-black uppercase tracking-[0.28em] text-purple-200/80">MindMesh</div>
+            <div className="mt-2 text-sm text-white/60">Chargement de la session...</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if ((currentPath === '/' || isSettingsRoute) && !user) {
+    if (typeof window !== 'undefined' && window.location.pathname === '/') {
+      navigate('/sign-in');
+    }
+    return <AuthView mode="sign-in" isDarkMode={isDarkMode} onNavigate={navigate} />;
+  }
+
+  if (isSettingsRoute) {
+    return <SettingsView isDarkMode={isDarkMode} onNavigate={navigate} />;
+  }
 
   const handleDownloadWorkspace = () => {
     const exportText = latestAssistantMessage.trim();
@@ -391,6 +473,17 @@ export default function App() {
     }
   };
 
+  const handleQuickAction = (prompt: string) => {
+    setMessage(prompt);
+    setCurrentView('chat');
+    window.setTimeout(() => messageInputRef.current?.focus(), 0);
+  };
+
+  const openDebugDashboard = () => {
+    if (!isAdmin) return;
+    setCurrentView('dashboard-debug');
+  };
+
   const handleExecuteWorkspace = async () => {
     if (isLoading || isExecutingWorkspace) return;
 
@@ -412,13 +505,69 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen w-full bg-[var(--background)] text-[var(--text)] font-sans overflow-hidden relative transition-colors duration-500">
+    <div className="flex min-h-dvh w-full flex-col bg-[var(--background)] text-[var(--text)] font-sans overflow-x-hidden relative transition-colors duration-500 lg:h-screen lg:flex-row lg:overflow-hidden">
       <div className={`absolute top-[-200px] right-[-100px] w-[900px] h-[900px] ${isDarkMode ? 'bg-purple-600/10' : 'bg-purple-400/15'} rounded-full blur-[180px] pointer-events-none transition-colors duration-1000`} />
       <div className={`absolute bottom-[-250px] left-[-100px] w-[800px] h-[800px] ${isDarkMode ? 'bg-pink-600/5' : 'bg-pink-400/10'} rounded-full blur-[160px] pointer-events-none transition-colors duration-1000`} />
       <div className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[1100px] h-[1100px] ${isDarkMode ? 'bg-purple-600/5' : 'bg-purple-400/10'} rounded-full blur-[220px] pointer-events-none transition-colors duration-1000`} />
       <div className="absolute inset-0 bg-dot-grid pointer-events-none opacity-[0.08]" />
 
-      <aside className="m-4 w-72 glass-dark rounded-[40px] border border-white/10 flex flex-col p-6 z-20 shadow-2xl overflow-hidden relative shrink-0">
+      <div className="fixed left-3 right-3 top-3 z-[60] flex items-center gap-2 lg:hidden">
+        <button
+          type="button"
+          onClick={() => {
+            setShowMobileWorkspace(false);
+            setShowMobileSidebar((prev) => !prev);
+            setShowMenu(false);
+          }}
+          className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-white shadow-2xl backdrop-blur-xl transition-colors"
+          aria-label="Ouvrir la navigation"
+        >
+          <Menu className="h-5 w-5" />
+        </button>
+
+        <div className="flex-1 rounded-2xl border border-white/10 bg-black/20 px-4 py-2 text-center text-[10px] font-black uppercase tracking-[0.28em] text-purple-200 shadow-2xl backdrop-blur-xl">
+          MindMesh
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            if (currentView === 'chat' && messages.length > 0) {
+              setShowMobileSidebar(false);
+              setShowMobileWorkspace((prev) => !prev);
+              setShowMenu(false);
+            }
+          }}
+          className="flex h-12 items-center gap-2 rounded-2xl border border-white/10 bg-black/20 px-4 text-[10px] font-black uppercase tracking-[0.2em] text-white shadow-2xl backdrop-blur-xl transition-colors disabled:opacity-40"
+          disabled={currentView !== 'chat' || messages.length === 0}
+          aria-label="Ouvrir l'espace de travail"
+        >
+          <LayoutDashboard className="h-4 w-4" />
+          <span>Workspace</span>
+        </button>
+
+        <motion.button
+          type="button"
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => setIsDarkMode(!isDarkMode)}
+          className="flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-black/20 text-white shadow-2xl backdrop-blur-xl transition-colors"
+          aria-label="Changer le thème"
+        >
+          {isDarkMode ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
+        </motion.button>
+      </div>
+
+      {(showMobileSidebar || showMobileWorkspace) && (
+        <button
+          type="button"
+          onClick={closeMobilePanels}
+          className="fixed inset-0 z-40 bg-black/45 backdrop-blur-sm lg:hidden"
+          aria-label="Fermer les panneaux"
+        />
+      )}
+
+      <aside className={`fixed inset-y-0 left-0 z-50 m-0 w-[86vw] max-w-[20rem] -translate-x-full overflow-y-auto glass-dark rounded-none rounded-r-[40px] border border-white/10 flex flex-col p-5 shadow-2xl relative shrink-0 transition-transform duration-300 lg:static lg:z-20 lg:m-4 lg:w-72 lg:translate-x-0 lg:overflow-hidden lg:rounded-[40px] lg:p-6 ${showMobileSidebar ? 'translate-x-0' : 'lg:translate-x-0'}`}>
         <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent pointer-events-none" />
         <div className="relative z-10 flex flex-col h-full">
           <div className="flex items-center justify-between mb-10">
@@ -427,7 +576,17 @@ export default function App() {
               <span className={`text-xl font-semibold tracking-tight ${isDarkMode ? 'text-white' : 'text-purple-950'}`}>MindMesh</span>
             </div>
 
-            <motion.button 
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={closeMobilePanels}
+                className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-white/70 transition-colors lg:hidden"
+                aria-label="Fermer la navigation"
+              >
+                <X className="h-4 w-4" />
+              </button>
+
+              <motion.button 
               whileHover={{ scale: 1.1, rotate: 10 }}
               whileTap={{ scale: 0.9 }}
               onClick={() => setIsDarkMode(!isDarkMode)}
@@ -435,10 +594,12 @@ export default function App() {
             >
               {isDarkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
             </motion.button>
+            </div>
           </div>
 
           <button
             onClick={() => {
+              closeMobilePanels();
               setCurrentView('chat');
               resetSession();
             }}
@@ -455,18 +616,40 @@ export default function App() {
             </div>
             <button
               type="button"
-              onClick={() => setCurrentView('dashboard')}
+              onClick={() => {
+                closeMobilePanels();
+                setCurrentView('dashboard');
+              }}
               className={`w-full flex items-center gap-3 px-4 py-3 rounded-2xl border text-xs font-semibold cursor-pointer transition-colors ${
-                currentView === 'dashboard'
+                currentView === 'dashboard' || currentView === 'dashboard-debug'
                   ? `${isDarkMode ? 'bg-purple-500/15 border-purple-400/40 text-white' : 'bg-purple-100 border-purple-300 text-purple-950'}`
                   : `${isDarkMode ? 'bg-white/5 border-white/5 text-white/80 hover:bg-purple-500/10' : 'bg-purple-900/5 border-purple-500/10 text-purple-950 hover:bg-purple-500/10'}`
               }`}
             >
-              <Activity className={`w-4 h-4 ${currentView === 'dashboard' ? 'text-purple-400' : 'text-purple-400/70'}`} />
-              <span className={currentView === 'dashboard' ? (isDarkMode ? 'text-white' : 'text-purple-950') : (isDarkMode ? 'text-white/80' : 'text-purple-950/85')}>
+              <Activity className={`w-4 h-4 ${currentView === 'dashboard' || currentView === 'dashboard-debug' ? 'text-purple-400' : 'text-purple-400/70'}`} />
+              <span className={currentView === 'dashboard' || currentView === 'dashboard-debug' ? (isDarkMode ? 'text-white' : 'text-purple-950') : (isDarkMode ? 'text-white/80' : 'text-purple-950/85')}>
                 Tableau de bord
               </span>
             </button>
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => {
+                  closeMobilePanels();
+                  setCurrentView('dashboard-debug');
+                }}
+                className={`mt-2 w-full flex items-center gap-3 px-4 py-3 rounded-2xl border text-xs font-semibold cursor-pointer transition-colors ${
+                  currentView === 'dashboard-debug'
+                    ? `${isDarkMode ? 'bg-purple-500/15 border-purple-400/40 text-white' : 'bg-purple-100 border-purple-300 text-purple-950'}`
+                    : `${isDarkMode ? 'bg-white/5 border-white/5 text-white/80 hover:bg-purple-500/10' : 'bg-purple-900/5 border-purple-500/10 text-purple-950 hover:bg-purple-500/10'}`
+                }`}
+              >
+                <ShieldCheck className={`w-4 h-4 ${currentView === 'dashboard-debug' ? 'text-purple-400' : 'text-purple-400/70'}`} />
+                <span className={currentView === 'dashboard-debug' ? (isDarkMode ? 'text-white' : 'text-purple-950') : (isDarkMode ? 'text-white/80' : 'text-purple-950/85')}>
+                  Tableau de bord Admin
+                </span>
+              </button>
+            )}
           </nav>
 
                     <div className="mb-6">
@@ -502,14 +685,6 @@ export default function App() {
             )}
           </div>
           <div className="mt-auto relative">
-            <SignedOut>
-              <SignInButton mode='modal'>
-                <button className='w-full glass p-3 rounded-xl text-sm font-bold text-white gradient-vibrant shadow-lg shadow-purple-500/20 hover:scale-105 transition-all'>
-                  Se connecter
-                </button>
-              </SignInButton>
-            </SignedOut>
-            
             <SignedIn>
               <div 
                 onClick={() => setShowMenu(!showMenu)} 
@@ -532,22 +707,14 @@ export default function App() {
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>
                     Passer Pro
                   </button>
-                  <button onClick={() => { openUserProfile(); setShowMenu(false); }} className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-[var(--text)] hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-colors">
+                  <button onClick={() => navigate('/settings')} className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-[var(--text)] hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-colors">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
                     Paramètres
                   </button>
-                  <button
-                    type="button"
-                    onClick={handleOpenBilling}
-                    className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-[var(--text)] hover:bg-gray-100 dark:hover:bg-white/10 rounded-lg transition-colors"
-                  >
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect><line x1="1" y1="10" x2="23" y2="10"></line></svg>
-                    Facturation
-                  </button>
                   <div className="h-px bg-gray-200 dark:bg-white/10 my-1"></div>
-                  <button onClick={() => signOut()} className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/20 rounded-lg transition-colors font-medium">
+                  <button onClick={() => void handleSignOut()} disabled={isSigningOut} className="w-full text-left flex items-center gap-3 px-4 py-2 text-sm text-red-500 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-500/20 rounded-lg transition-colors font-medium disabled:opacity-70">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
-                    Déconnexion
+                    {isSigningOut ? 'Déconnexion en cours...' : 'Déconnexion'}
                   </button>
                 </div>
               )}
@@ -556,8 +723,8 @@ export default function App() {
         </div>
       </aside>
 
-      <main className="flex-1 flex flex-col relative z-20 bg-transparent min-w-0">
-        <div className="absolute top-8 right-10 z-30">
+      <main className="flex-1 flex flex-col relative z-20 bg-transparent min-w-0 pt-16 lg:pt-0">
+        <div className="absolute top-8 right-10 z-30 hidden lg:block">
           <motion.div 
             whileHover={{ scale: 1.05 }}
             whileTap={{ scale: 0.95 }}
@@ -567,14 +734,23 @@ export default function App() {
           </motion.div>
         </div>
 
-        <div className="flex-1 p-10 flex flex-col items-center justify-center relative overflow-hidden">
+        <div className="flex-1 p-4 pb-4 flex flex-col items-center justify-center relative overflow-hidden lg:p-10">
           {currentView === 'dashboard' ? (
             <DashboardView
+              messages={messages}
+              isDarkMode={isDarkMode}
+              isAdmin={isAdmin}
+              onQuickAction={handleQuickAction}
+              onBackToChat={() => setCurrentView('chat')}
+              onOpenDebug={openDebugDashboard}
+            />
+          ) : currentView === 'dashboard-debug' && isAdmin ? (
+            <AdminDashboardView
               backendSnapshot={backendSnapshot}
               metricsSnapshot={metricsSnapshot}
               isRefreshingSnapshot={isRefreshingSnapshot}
               refreshBackendSnapshot={refreshBackendSnapshot}
-              onClose={() => setCurrentView('chat')}
+              onClose={() => setCurrentView('dashboard')}
               formatSnapshotTime={formatSnapshotTime}
               formatCounter={formatCounter}
               shrinkText={shrinkText}
@@ -684,16 +860,13 @@ export default function App() {
           )}
         </div>
 
-        <div className="p-10 pt-0 w-full flex justify-center">
-          <div className="flex flex-col items-center gap-8 w-full max-w-4xl">
+        <div className="p-4 pt-0 w-full flex justify-center lg:p-10 lg:pt-0">
+          <div className="flex flex-col items-center gap-4 w-full max-w-4xl lg:gap-8">
             {workspaceNotice && (
               <div className={`w-full rounded-2xl border px-4 py-3 text-sm font-medium ${workspaceNoticeToneClass}`}>
                 {workspaceNotice.text}
               </div>
             )}
-            <SignedOut>
-              <div className='w-full text-center p-4 glass rounded-2xl text-[var(--text-dim)] text-sm'>Veuillez vous connecter pour instruire MindMesh.</div>
-            </SignedOut>
             <SignedIn>
             <motion.div 
               initial={{ opacity: 0, scale: 0.98 }}
@@ -702,7 +875,7 @@ export default function App() {
               className="w-full relative group"
             >
               <div className={`absolute -inset-0.5 bg-gradient-to-r from-purple-500/20 to-pink-500/20 rounded-[32px] blur opacity-0 group-focus-within:opacity-100 transition-opacity duration-700`} />
-              <div className={`relative glass-heavy h-20 rounded-[32px] border ${isDarkMode ? 'border-white/5 bg-black/20' : 'border-purple-200 bg-white/80'} flex items-center p-2 group-focus-within:border-purple-400 transition-all duration-300 shadow-2xl`}>
+              <div className={`relative glass-heavy min-h-20 rounded-[32px] border ${isDarkMode ? 'border-white/5 bg-black/20' : 'border-purple-200 bg-white/80'} flex flex-wrap items-center gap-2 p-2 group-focus-within:border-purple-400 transition-all duration-300 shadow-2xl md:h-20 md:flex-nowrap md:gap-0`}>
                 
                 <button 
                   type="button"
@@ -725,9 +898,9 @@ export default function App() {
 
                 <input type="file" multiple className="hidden" ref={attachmentInputRef} onChange={onAttachmentSelection} accept={CHAT_ATTACHMENT_ACCEPT} />
 
-                <div className="flex-1 min-w-0 flex items-center gap-2 px-2">
+                <div className="flex-1 min-w-0 flex items-center gap-2 px-2 w-full md:w-auto">
                   {attachmentPreviews.length > 0 && (
-                    <div className={`flex items-center gap-2 shrink-0 max-w-[42%] overflow-x-auto text-[10px] ${isDarkMode ? 'text-white/50' : 'text-slate-500'}`}>
+                    <div className={`flex items-center gap-2 shrink-0 max-w-full md:max-w-[42%] overflow-x-auto text-[10px] ${isDarkMode ? 'text-white/50' : 'text-slate-500'}`}>
                       {attachmentPreviews.map((attachment) => (
                         <span
                           key={attachment.id}
@@ -768,7 +941,7 @@ export default function App() {
                   type="button"
                   onClick={handleSend}
                   disabled={isLoading || !message.trim() || isRecording}
-                  className={`w-14 h-14 gradient-vibrant rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/40 transition-all duration-300 shrink-0 ${
+                  className={`w-full h-12 md:w-14 md:h-14 gradient-vibrant rounded-2xl flex items-center justify-center shadow-lg shadow-purple-500/40 transition-all duration-300 shrink-0 ${
                     isLoading || !message.trim() || isRecording ? 'opacity-50 scale-100 cursor-not-allowed' : 'hover:scale-105 active:scale-95'
                   }`}
                 >
@@ -782,18 +955,18 @@ export default function App() {
       </main>
 
       <AnimatePresence>
-        {currentView === 'chat' && messages.length > 0 && (
-          <motion.aside 
-            initial={{ opacity: 0, width: 0, marginRight: 0 }}
-            animate={{ opacity: 1, width: "34rem", marginRight: "1rem" }}
-            exit={{ opacity: 0, width: 0, marginRight: 0 }}
-            className="my-4 glass-dark rounded-[40px] border border-white/10 flex flex-col pt-6 overflow-y-auto custom-scrollbar z-20 shadow-2xl relative overflow-hidden shrink-0"
-          >
-            <div className="absolute inset-0 bg-gradient-to-bl from-white/5 to-transparent pointer-events-none" />
-            <div className="relative z-10 flex flex-col h-full w-[34rem]">
-              <div className="px-10 pb-6 border-b border-white/5">
-                <div className="flex items-center justify-between mb-8">
-                  <div className={`flex items-center gap-1 rounded-2xl border p-1 backdrop-blur-xl ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-200 bg-white/60'}`}>
+          {currentView === 'chat' && messages.length > 0 && (
+            <motion.aside 
+              initial={{ opacity: 0, width: 0, marginRight: 0 }}
+              animate={{ opacity: 1, width: '34rem', marginRight: '1rem' }}
+              exit={{ opacity: 0, width: 0, marginRight: 0 }}
+              className={`my-0 lg:my-4 fixed inset-y-0 right-0 z-50 w-[92vw] max-w-[28rem] translate-x-full glass-dark rounded-l-[40px] rounded-r-none border border-white/10 flex flex-col pt-6 overflow-y-auto custom-scrollbar shadow-2xl relative overflow-hidden shrink-0 transition-transform duration-300 lg:static lg:z-20 lg:w-[34rem] lg:max-w-none lg:translate-x-0 lg:rounded-[40px] lg:mr-4 ${showMobileWorkspace ? 'translate-x-0' : 'lg:translate-x-0'}`}
+            >
+              <div className="absolute inset-0 bg-gradient-to-bl from-white/5 to-transparent pointer-events-none" />
+              <div className="relative z-10 flex flex-col h-full w-full lg:w-[34rem]">
+                <div className="px-5 pb-6 border-b border-white/5 lg:px-10">
+                  <div className="flex items-center justify-between mb-8">
+                    <div className={`flex items-center gap-1 rounded-2xl border p-1 backdrop-blur-xl ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-200 bg-white/60'}`}>
                     {[
                       { id: 'preview' as const, label: 'Aperçu', icon: Eye },
                       { id: 'code' as const, label: 'Code', icon: Code },
@@ -850,9 +1023,9 @@ export default function App() {
                     <div className={`w-1.5 h-1.5 rounded-full ${workspaceRuntimeDotClass}`} />
                     <span className={`text-[9px] font-black tracking-widest uppercase ${workspaceRuntimeTextClass}`}>{workspaceRuntimeLabel}</span>
                   </div>
-              </div>
+                </div>
 
-              <div className="px-10 pt-8">
+              <div className="px-5 pt-8 lg:px-10">
                 <div className={`rounded-[28px] border backdrop-blur-xl p-6 ${isDarkMode ? 'border-white/10 bg-white/5' : 'border-purple-200 bg-white/70'}`}>
                   {activeTab === 'preview' ? (
                     <div className={`markdown-body ${markdownBubbleClass} text-sm leading-relaxed ${isDarkMode ? 'text-gray-200' : 'text-slate-700'}`}>
@@ -868,7 +1041,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="px-10 py-8">
+              <div className="px-5 py-8 lg:px-10">
                 <h3 className={`text-[9px] font-black tracking-[0.3em] uppercase ${isDarkMode ? 'text-white/20' : 'text-purple-900/40'} mb-8 flex items-center gap-3 transition-colors`}>
                   <Activity className="w-4 h-4 text-purple-400/60" />
                   ÉQUIPE MOBILISÉE
@@ -913,7 +1086,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="mt-auto px-10 py-8 border-t border-white/5 bg-transparent">
+              <div className="mt-auto px-5 py-8 border-t border-white/5 bg-transparent lg:px-10">
                 <div className="grid grid-cols-2 gap-4 mb-8">
                   <div className={`p-4 rounded-2xl border ${isDarkMode ? 'border-white/5 bg-white/5' : 'border-purple-100 bg-white/60'}`}>
                       <div className={`flex items-center gap-2 ${isDarkMode ? 'text-white/40' : 'text-purple-950/60'} text-[8px] font-black uppercase tracking-widest mb-1`}>
@@ -959,9 +1132,16 @@ export default function App() {
               </div>
             </div>
             </div>
-          </motion.aside>
+            </motion.aside>
         )}
       </AnimatePresence>
+
+      <PricingModal
+        open={showPricingModal}
+        onClose={() => setShowPricingModal(false)}
+        onNavigate={navigate}
+        isDarkMode={isDarkMode}
+      />
 
       <style>{`
         .custom-scrollbar::-webkit-scrollbar { width: 4px; }
